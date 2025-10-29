@@ -82,7 +82,7 @@ cat $OUTPUT/DEP/npm.checked | grep "is available" | cut -d ' ' -f2 | anew $OUTPU
 
 notice "[-] Checking pypi dependencies: $ORG "
 cat "$OUTPUT/DEP/pip.deps" | sed 's/[[:space:]]//g' | awk '{print $1}' | xargs -I {} pip-name {} | anew $OUTPUT/DEP/pip.checked
-cat $OUTPUT/DEP/pip.checked | grep "is available" | cut -d ' ' -f2 | anew $OUTPUT/DEP/pip.potential
+cat $OUTPUT/DEP/pip.checked | grep "is available" | awk '{print $1}' | anew $OUTPUT/DEP/pip.potential
 
 notice "[-] Checking ruby Gem dependencies: $ORG "
 cat "$OUTPUT/DEP/ruby.deps" | xargs -I {} bash -c 'gem-name "$@"' _ {} | grep "is available" | cut -d ' ' -f1 | anew $OUTPUT/DEP/gem.potential
