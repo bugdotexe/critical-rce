@@ -100,7 +100,12 @@ function isValidPackageName(name) {
   if (/^[^a-zA-Z0-9@]/.test(name) || /^[*~!@#$%^&()+={\}[\]|:;"'<>,?/`]$/.test(name)) {
     return false;
   }
-  
+
+  // NEW: Filter out package names with capital letters (npm doesn't allow them)
+  if (/[A-Z]/.test(name)) {
+    return false;
+  }
+   
   // Additional npm package naming validation
   if (name.length === 0 || name.length > 214) return false;
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) return false;
