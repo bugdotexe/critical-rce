@@ -1,533 +1,421 @@
-#!/usr/bin/env python3
+#!/bin/bash
 
-"""
-Smart LLM Dependency Confusion Triager - v2.0
+# Smart Dependency Confusion Triager v2.0
+# Uses GPT-4o and ripgrep for deep context analysis
 
-A context-aware triager that uses LLM intelligence to classify dependency confusion risks
-across diverse codebases without predefined categories.
+notice() { printf '\e[1;34m[INFO]\e[0m %s\n' "$*"; }
+warn()   { printf '\e[1;33m[WARN]\e[0m %s\n' "$*"; }
+err()    { printf '\e[1;31m[ERROR]\e[0m %s\n' "$*"; }
+success() { printf '\e[1;32m[SUCCESS]\e[0m %s\n' "$*"; }
 
-Usage:
-    python3 smart_triager.py /path/to/scan/output
-    python3 smart_triager.py /tmp/project-scan
-
-Features:
-- No hardcoded classifications (Potential Vulnerability/False Positive)
-- Adapts to different project types (web apps, libraries, internal tools, etc.)
-- Considers project context and usage patterns
-- Provides nuanced risk assessments
-"""
-
-import os
-import sys
-import json
-import time
-import requests
-import csv
-import subprocess
-import re
-import shutil
-import shlex
-from typing import List, Dict, Optional, Any, Tuple
-from pathlib import Path
-
-# --- Configuration ---
-API_KEY = os.environ.get("OPENAI_API_KEY")
-API_URL = "https://api.openai.com/v1/chat/completions"
-MODEL_NAME = "gpt-4o"  # Using latest model for better reasoning
-SEARCH_TIMEOUT = 20
-MAX_CONTEXTS = 25
-RATE_LIMIT_DELAY = 1.5  # Seconds between API calls
-
-# ANSI color codes
-class Colors:
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    RED = '\033[1;31m'
-    GREEN = '\033[1;32m'
-    YELLOW = '\033[1;33m'
-    BLUE = '\033[1;34m'
-    CYAN = '\033[1;36m'
-    MAGENTA = '\033[1;35m'
-    WHITE = '\033[1;37m'
-    GREY = '\033[0;37m'
-
-USE_RIPGREP = False
-
-# --- Adaptive System Prompt ---
-SYSTEM_PROMPT = """
-You are a senior security engineer performing dependency confusion analysis. Your task is to assess the risk level of available package names found in a codebase.
-
-**CONTEXT ANALYSIS FRAMEWORK:**
-
-Consider these factors when assessing risk:
-
-1. **Package Name Characteristics:**
-   - Does it sound internal/proprietary? (e.g., "company-auth", "internal-utils")
-   - Is it generic/common? (e.g., "utils", "helpers", "common")
-   - Does it contain organization/project-specific terms?
-   - Is it scoped? (e.g., "@myorg/package")
-
-2. **Codebase Context:**
-   - How is the package used? (direct dependency, dev dependency, in scripts)
-   - Is there evidence of private registry configuration?
-   - Are there workspace references or local paths?
-   - Is it in dependency files (package.json, requirements.txt) or just in code comments/docs?
-
-3. **Project Type Considerations:**
-   - Web applications vs libraries vs internal tools
-   - Open source vs enterprise/internal projects
-   - Modern vs legacy codebases
-
-4. **Risk Indicators:**
-   - Package names that match internal naming conventions
-   - Missing private registry configurations
-   - Direct usage without version pins or hashes
-   - Presence in critical dependency files
-
-**Provide a nuanced assessment without forcing binary classifications.**
-
-Response Format (JSON only):
-{
-  "risk_level": "Critical/High/Medium/Low/Informational",
-  "category": "Internal Package/Third Party/Unclear/Test/Utility/Scope Takeover/etc.",
-  "confidence": "High/Medium/Low",
-  "justification": "Detailed reasoning based on the evidence",
-  "recommendation": "Specific action items",
-  "requires_immediate_attention": true/false
+# Check dependencies
+check_deps() {
+    if ! command -v rg &> /dev/null; then
+        err "ripgrep (rg) is required but not installed"
+        exit 1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        err "jq is required but not installed"
+        exit 1
+    fi
+    
+    if [ -z "$OPENAI_API_KEY" ]; then
+        err "OPENAI_API_KEY environment variable required"
+        exit 1
+    fi
 }
-"""
 
-def detect_project_type(source_dir: str) -> Dict[str, Any]:
-    """Automatically detect project characteristics."""
-    project_info = {
-        "type": "unknown",
-        "ecosystems": [],
-        "has_private_registry_config": False,
-        "is_likely_internal": False,
-        "characteristics": []
-    }
-    
-    # Check for common project files
-    files = []
-    for root, dirs, filenames in os.walk(source_dir):
-        files.extend(filenames)
-        break  # Just top level for now
-    
-    file_set = set(files)
-    
-    # Detect ecosystems
-    if 'package.json' in file_set:
-        project_info["ecosystems"].append("npm")
-        # Check for private registry config
-        try:
-            with open(os.path.join(source_dir, 'package.json'), 'r') as f:
-                pkg_json = json.load(f)
-                if any(key in pkg_json for key in ['publishConfig', '_authToken', 'registry']):
-                    project_info["has_private_registry_config"] = True
-        except:
-            pass
-    
-    if 'requirements.txt' in file_set or 'setup.py' in file_set or 'Pipfile' in file_set:
-        project_info["ecosystems"].append("python")
-    
-    if 'Gemfile' in file_set:
-        project_info["ecosystems"].append("ruby")
-    
-    if 'pom.xml' in file_set:
-        project_info["ecosystems"].append("java")
-    
-    if 'go.mod' in file_set:
-        project_info["ecosystems"].append("go")
-    
-    # Detect project type
-    if any(f in file_set for f in ['docker-compose.yml', 'Dockerfile', 'k8s']):
-        project_info["characteristics"].append("containerized")
-    
-    if any(f in file_set for f in ['.github', '.gitlab-ci.yml', 'Jenkinsfile']):
-        project_info["characteristics"].append("ci_cd")
-    
-    # Heuristics for internal projects
-    internal_indicators = ['internal', 'proprietary', 'company', 'corp', 'enterprise']
-    dir_name = os.path.basename(source_dir.rstrip('/'))
-    if any(indicator in dir_name.lower() for indicator in internal_indicators):
-        project_info["is_likely_internal"] = True
-    
-    if project_info["ecosystems"]:
-        project_info["type"] = "application"
-    elif any(f.endswith('.md') for f in files):
-        project_info["type"] = "documentation"
-    
-    return project_info
+# Parse arguments
+TARGET_DIR=""
+OUTPUT_DIR=""
+MODEL="gpt-4o"  # Latest model as of 2024
 
-def check_for_ripgrep() -> bool:
-    """Check if ripgrep is available."""
-    return bool(shutil.which("rg"))
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -t|--target)
+            TARGET_DIR="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -m|--model)
+            MODEL="$2"
+            shift 2
+            ;;
+        *)
+            err "Usage: $0 -t <target_directory> [-o <output_directory>] [-m <model>]"
+            exit 1
+            ;;
+    esac
+done
 
-def strip_ansi_codes(text: str) -> str:
-    """Remove ANSI escape codes from text."""
-    if not text:
-        return ""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', text)
+if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+    err "Target directory required and must exist"
+    exit 1
+fi
 
-def validate_package_name(package_name: str) -> bool:
-    """Validate package name for safety."""
-    if not package_name or len(package_name) > 200:
-        return False
-    dangerous_patterns = [';', '|', '&', '`', '$', '>', '<', '\n', '\r']
-    return not any(pattern in package_name for pattern in dangerous_patterns)
+if [ -z "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="$TARGET_DIR/llm_triage_$(date +%Y%m%d_%H%M%S)"
+fi
 
-def safe_file_read(file_path: str) -> Optional[str]:
-    """Safely read file with error handling."""
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read()
-    except Exception as e:
-        print(f"[{Colors.RED}ERROR{Colors.RESET}] Failed to read {file_path}: {e}")
-        return None
+mkdir -p "$OUTPUT_DIR"
+check_deps
 
-def find_package_context(package_name: str, search_dir: str) -> List[Dict[str, Any]]:
-    """Find all occurrences of package name with enhanced context gathering."""
-    contexts = []
+notice "Starting advanced LLM triage for: $TARGET_DIR"
+notice "Output directory: $OUTPUT_DIR"
+notice "Using model: $MODEL"
+notice "Using ripgrep for context analysis"
+
+# Enhanced context extraction with ripgrep
+extract_deep_context() {
+    local package_name="$1"
+    local package_type="$2"
+    local context_file="$3"
     
-    # Try multiple search strategies
-    search_patterns = [
-        package_name,  # Exact match
-        f'"{package_name}"',  # Quoted (common in package.json)
-        f"'{package_name}'",  # Single quoted
-        f"\\b{re.escape(package_name)}\\b",  # Word boundary for regex
-    ]
+    echo "# Deep Context Analysis for: $package_name ($package_type)" > "$context_file"
+    echo "## Analysis Date: $(date)" >> "$context_file"
+    echo "" >> "$context_file"
     
-    for pattern in search_patterns[:2]:  # Just use first two for performance
-        try:
-            if USE_RIPGREP:
-                cmd = [
-                    "rg", "-n", "-i", "--no-heading", "--no-ignore",
-                    "-g", "!*.log", "-g", "!*.min.js", "-g", "!node_modules/",
-                    "-g", "!*.pyc", "-g", "!__pycache__/", "-g", "!*.git/",
-                    pattern, search_dir
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
-            else:
-                grep_cmd = f"grep -rni {shlex.quote(pattern)} {shlex.quote(search_dir)}"
-                exclude_cmd = "grep -vE '(node_modules|\\.log|\\.min\\.js|\\.pyc|__pycache__|\\.git)'"
-                full_cmd = f"{grep_cmd} | {exclude_cmd}"
-                result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
+    # Escape package name for regex
+    local escaped_pkg=$(printf '%s' "$package_name" | sed 's/[][\.*^$(){}?+|]/\\&/g')
+    
+    echo "## Repository Structure Overview" >> "$context_file"
+    echo '```' >> "$context_file"
+    find "$TARGET_DIR" -type f -name "*.json" -o -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.rb" -o -name "*.go" -o -name "*.java" -o -name "*.toml" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.txt" | \
+        head -50 | sed "s|$TARGET_DIR/||" >> "$context_file"
+    echo '```' >> "$context_file"
+    echo "" >> "$context_file"
+    
+    echo "## All Code References (ripgrep analysis)" >> "$context_file"
+    echo '```' >> "$context_file"
+    rg --color=never --no-heading --line-number --max-count=50 --type=json --type=js --type=ts --type=py --type=rb --type=go --type=java --type=toml --type=yaml --type=yml --type=md --type=txt "$escaped_pkg" "$TARGET_DIR" 2>/dev/null | \
+        head -100 >> "$context_file"
+    echo '```' >> "$context_file"
+    echo "" >> "$context_file"
+    
+    # Ecosystem-specific deep analysis
+    case "$package_type" in
+        "npm")
+            echo "## NPM-Specific Analysis" >> "$context_file"
+            echo "### package.json files containing package:" >> "$context_file"
+            rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "package.json" 2>/dev/null | while read -r file; do
+                echo "**File:** $file" >> "$context_file"
+                echo '```json' >> "$context_file"
+                jq 'with_entries(select([.key] | inside(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"])))' "$file" 2>/dev/null | \
+                    grep -A2 -B2 "$package_name" >> "$context_file" || \
+                    rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                echo '```' >> "$context_file"
+            done
             
-            if result.stdout:
-                for line in result.stdout.strip().split('\n'):
-                    if not line.strip():
-                        continue
-                    
-                    match = re.match(r'([^:]+):(\d+):(.*)', line)
-                    if match:
-                        file_path, line_num_str, content = match.groups()
-                        
-                        # Skip binary files and very long lines
-                        if len(content) > 500:
-                            content = content[:500] + "..."
-                        
-                        contexts.append({
-                            "file": os.path.relpath(file_path, search_dir),
-                            "line": int(line_num_str),
-                            "content": content.strip(),
-                            "file_type": Path(file_path).suffix.lower()
-                        })
-                        
-                        if len(contexts) >= MAX_CONTEXTS:
-                            break
-                
-        except subprocess.TimeoutExpired:
-            continue
-        except Exception:
-            continue
-        
-        if contexts:
-            break
-    
-    return contexts
-
-def analyze_package_with_llm(package_name: str, package_type: str, 
-                           project_context: Dict, code_context: List[Dict],
-                           max_retries: int = 3) -> Optional[Dict[str, Any]]:
-    """Analyze package with contextual LLM reasoning."""
-    print(f"  [{Colors.CYAN}ANALYZE{Colors.RESET}] {package_type}: {Colors.BOLD}{package_name}{Colors.RESET}")
-    
-    # Prepare enhanced context
-    analysis_context = {
-        "package": package_name,
-        "ecosystem": package_type,
-        "project_characteristics": project_context,
-        "usage_contexts": code_context,
-        "total_contexts_found": len(code_context)
-    }
-    
-    user_prompt = f"""
-Analyze this package for dependency confusion risk:
-
-**Package Details:**
-- Name: {package_name}
-- Ecosystem: {package_type}
-- Project Type: {project_context.get('type', 'unknown')}
-- Ecosystems Detected: {', '.join(project_context.get('ecosystems', []))}
-- Private Registry Configured: {project_context.get('has_private_registry_config', False)}
-- Likely Internal Project: {project_context.get('is_likely_internal', False)}
-
-**Usage Context ({len(code_context)} instances found):**
-{json.dumps(code_context, indent=2) if code_context else "No usage context found in codebase"}
-
-Provide a nuanced risk assessment based on the package characteristics and how it's used in this specific project context.
-"""
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,  # Slightly higher for nuanced reasoning
-        "max_tokens": 800
-    }
-
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {API_KEY}'
-    }
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=90)
-            if response.status_code == 200:
-                result = response.json()
-                json_text = result.get('choices', [{}])[0].get('message', {}).get('content', '{}')
-                
-                try:
-                    analysis = json.loads(json_text)
-                    # Validate required fields
-                    required_fields = ['risk_level', 'category', 'confidence', 'justification', 'recommendation']
-                    if all(field in analysis for field in required_fields):
-                        analysis['package_name'] = package_name
-                        analysis['package_type'] = package_type
-                        analysis['contexts_analyzed'] = len(code_context)
-                        return analysis
-                    else:
-                        print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Missing fields in LLM response")
-                        return None
-                except json.JSONDecodeError as e:
-                    print(f"    [{Colors.RED}ERROR{Colors.RESET}] JSON parse error: {e}")
-                    return None
-                    
-            elif response.status_code == 429:
-                wait_time = (2 ** attempt) * 10
-                print(f"    [{Colors.YELLOW}RATE_LIMIT{Colors.RESET}] Waiting {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                print(f"    [{Colors.RED}ERROR{Colors.RESET}] API error {response.status_code}")
-                if attempt == max_retries - 1:
-                    return None
-                    
-        except requests.RequestException as e:
-            print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Request failed: {e}")
-            if attempt == max_retries - 1:
-                return None
-        
-        time.sleep(2 ** attempt)  # Exponential backoff
-
-    return None
-
-def load_potential_packages(source_dir: str) -> List[Tuple[str, str]]:
-    """Load packages from all potential files."""
-    packages = []
-    dep_dir = os.path.join(source_dir, "DEP")
-    
-    if not os.path.isdir(dep_dir):
-        print(f"[{Colors.RED}ERROR{Colors.RESET}] DEP directory not found")
-        return packages
-
-    for potential_file in Path(dep_dir).glob("*.potential"):
-        package_type = potential_file.stem  # npm, pip, gem, etc.
-        
-        content = safe_file_read(str(potential_file))
-        if content:
-            for line in content.splitlines():
-                package_name = strip_ansi_codes(line.strip())
-                if package_name and validate_package_name(package_name):
-                    packages.append((package_name, package_type))
-    
-    return packages
-
-def generate_comprehensive_report(results: List[Dict], report_path: str, project_info: Dict):
-    """Generate detailed analysis report."""
-    try:
-        with open(report_path, 'w', newline='') as f:
-            fieldnames = [
-                'package_name', 'package_type', 'risk_level', 'category', 
-                'confidence', 'requires_immediate_attention', 'contexts_analyzed',
-                'justification', 'recommendation', 'timestamp'
-            ]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
+            echo "### Workspace Configuration:" >> "$context_file"
+            rg --color=never -A2 -B2 "workspace:" "$TARGET_DIR" -g "package.json" 2>/dev/null >> "$context_file"
+            ;;
             
-            for result in results:
-                row = {
-                    'package_name': result.get('package_name', ''),
-                    'package_type': result.get('package_type', ''),
-                    'risk_level': result.get('risk_level', 'Unknown'),
-                    'category': result.get('category', 'Unknown'),
-                    'confidence': result.get('confidence', 'Unknown'),
-                    'requires_immediate_attention': result.get('requires_immediate_attention', False),
-                    'contexts_analyzed': result.get('contexts_analyzed', 0),
-                    'justification': result.get('justification', ''),
-                    'recommendation': result.get('recommendation', ''),
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        "pip")
+            echo "## Python-Specific Analysis" >> "$context_file"
+            echo "### Requirements files:" >> "$context_file"
+            rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "requirements*.txt" -g "Pipfile" -g "pyproject.toml" -g "setup.py" 2>/dev/null | while read -r file; do
+                echo "**File:** $file" >> "$context_file"
+                echo '```' >> "$context_file"
+                rg --color=never -A2 -B2 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                echo '```' >> "$context_file"
+            done
+            ;;
+            
+        "gem")
+            echo "## Ruby-Specific Analysis" >> "$context_file"
+            rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "Gemfile" -g "*.gemspec" 2>/dev/null | while read -r file; do
+                echo "**File:** $file" >> "$context_file"
+                echo '```ruby' >> "$context_file"
+                rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                echo '```' >> "$context_file"
+            done
+            ;;
+            
+        "go")
+            echo "## Go-Specific Analysis" >> "$context_file"
+            rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "go.mod" 2>/dev/null | while read -r file; do
+                echo "**File:** $file" >> "$context_file"
+                echo '```go' >> "$context_file"
+                rg --color=never -A2 -B2 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                echo '```' >> "$context_file"
+            done
+            ;;
+            
+        "maven")
+            echo "## Maven-Specific Analysis" >> "$context_file"
+            rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "pom.xml" 2>/dev/null | while read -r file; do
+                echo "**File:** $file" >> "$context_file"
+                echo '```xml' >> "$context_file"
+                rg --color=never -A5 -B5 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                echo '```' >> "$context_file"
+            done
+            ;;
+    esac
+    
+    # Source analysis
+    echo "## Source Analysis" >> "$context_file"
+    echo "### Git URLs:" >> "$context_file"
+    rg --color=never -A1 -B1 "git.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file"
+    
+    echo "### Local Paths:" >> "$context_file"
+    rg --color=never -A1 -B1 "file:.*$escaped_pkg\|path:.*$escaped_pkg\|\.\/.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file"
+    
+    echo "### Private Registries:" >> "$context_file"
+    rg --color=never -A1 -B1 "registry.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file"
+    
+    echo "## Import/Usage Patterns" >> "$context_file"
+    rg --color=never -A2 -B2 "import.*$escaped_pkg\|require.*$escaped_pkg\|from.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -30 >> "$context_file"
+}
+
+# LLM analysis with contextual decision making
+analyze_with_gpt4o() {
+    local package_name="$1"
+    local package_type="$2"
+    local context_file="$3"
+    local output_file="$4"
+    
+    local context_content
+    context_content=$(cat "$context_file")
+    
+    # Smart prompt that lets the model reason based on context
+    local prompt="Analyze this dependency confusion scenario based on the comprehensive codebase context provided.
+
+## Package Information
+- Name: $package_name
+- Ecosystem: $package_type  
+- Project Context: Full codebase analysis provided below
+
+## Comprehensive Codebase Context
+$context_content
+
+## Analysis Task
+Based on the actual codebase context above, determine if this package represents a real dependency confusion vulnerability.
+
+Consider:
+- How the package is actually used in the codebase
+- Whether it's sourced from public registry vs private/git/local
+- The project structure and dependency patterns
+- Whether this appears to be an internal package or public dependency
+- Any workspace, local path, or private registry configurations
+
+Provide a thorough analysis based on the evidence found in the codebase context."
+
+    local response
+    response=$(curl -s -X POST "https://api.openai.com/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
+        -d "{
+            \"model\": \"$MODEL\",
+            \"messages\": [
+                {
+                    \"role\": \"system\", 
+                    \"content\": \"You are a senior security engineer with deep expertise in dependency management and supply chain security. Analyze codebase context thoroughly and provide evidence-based assessments. Focus on actual usage patterns and sourcing methods found in the code.\"
+                },
+                {
+                    \"role\": \"user\", 
+                    \"content\": \"$prompt\"
                 }
-                writer.writerow(row)
-                
-        print(f"[{Colors.GREEN}SUCCESS{Colors.RESET}] Report saved: {report_path}")
-    except Exception as e:
-        print(f"[{Colors.RED}ERROR{Colors.RESET}] Failed to write report: {e}")
+            ],
+            \"response_format\": { \"type\": \"json_object\" },
+            \"temperature\": 0.1,
+            \"max_tokens\": 1500
+        }")
+    
+    if [ $? -eq 0 ] && [ -n "$response" ]; then
+        local analysis
+        analysis=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
+        if [ -n "$analysis" ] && [ "$analysis" != "null" ]; then
+            echo "$analysis" > "$output_file"
+            return 0
+        fi
+    fi
+    
+    err "LLM analysis failed for $package_name"
+    return 1
+}
 
-def print_intelligent_summary(results: List[Dict], project_info: Dict):
-    """Print adaptive summary based on findings."""
-    if not results:
-        print(f"\n[{Colors.YELLOW}INFO{Colors.RESET}] No packages were analyzed")
-        return
+# Process all potential packages
+process_potential_packages() {
+    local dep_dir="$TARGET_DIR/DEP"
     
-    # Dynamic risk categorization
-    risk_groups = {}
-    for result in results:
-        risk_level = result.get('risk_level', 'Unknown')
-        if risk_level not in risk_groups:
-            risk_groups[risk_level] = []
-        risk_groups[risk_level].append(result)
+    if [ ! -d "$dep_dir" ]; then
+        err "DEP directory not found: $dep_dir"
+        err "Run the main scan script first to generate .potential files"
+        exit 1
+    fi
     
-    # Count immediate attention items
-    urgent_count = sum(1 for r in results if r.get('requires_immediate_attention', False))
+    local context_dir="$OUTPUT_DIR/contexts"
+    local analysis_dir="$OUTPUT_DIR/analysis"
+    local reports_dir="$OUTPUT_DIR/reports"
     
-    print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
-    print(f"{Colors.BOLD}           SMART DEPENDENCY TRIAGE SUMMARY{Colors.RESET}")
-    print(f"{Colors.CYAN}{'='*70}{Colors.RESET}")
-    print(f"  Project Type: {Colors.BOLD}{project_info.get('type', 'Unknown')}{Colors.RESET}")
-    print(f"  Ecosystems: {Colors.BOLD}{', '.join(project_info.get('ecosystems', ['Unknown']))}{Colors.RESET}")
-    print(f"  Private Registry: {Colors.BOLD}{project_info.get('has_private_registry_config', False)}{Colors.RESET}")
-    print(f"  Total Packages Analyzed: {Colors.BOLD}{len(results)}{Colors.RESET}")
-    print(f"  Requires Immediate Attention: {Colors.RED if urgent_count > 0 else Colors.GREEN}{urgent_count}{Colors.RESET}")
-    print(f"{Colors.CYAN}{'-'*70}{Colors.RESET}")
+    mkdir -p "$context_dir" "$analysis_dir" "$reports_dir"
     
-    # Display findings by risk level
-    risk_order = ['Critical', 'High', 'Medium', 'Low', 'Informational', 'Unknown']
-    for risk in risk_order:
-        if risk in risk_groups:
-            count = len(risk_groups[risk])
-            color = {
-                'Critical': Colors.RED,
-                'High': Colors.RED,
-                'Medium': Colors.YELLOW,
-                'Low': Colors.GREEN,
-                'Informational': Colors.BLUE,
-                'Unknown': Colors.GREY
-            }.get(risk, Colors.WHITE)
+    local total_packages=0
+    local processed=0
+    
+    # Count total packages
+    for potential_file in "$dep_dir"/*.potential; do
+        if [ -f "$potential_file" ]; then
+            local count
+            count=$(wc -l < "$potential_file" 2>/dev/null || echo "0")
+            total_packages=$((total_packages + count))
+        fi
+    done
+    
+    if [ "$total_packages" -eq 0 ]; then
+        warn "No potential packages found in $dep_dir"
+        return 1
+    fi
+    
+    notice "Found $total_packages potential packages to analyze"
+    
+    # Process each potential file
+    for potential_file in "$dep_dir"/*.potential; do
+        if [ ! -f "$potential_file" ]; then
+            continue
+        fi
+        
+        local package_type
+        package_type=$(basename "$potential_file" .potential)
+        local package_count
+        package_count=$(wc -l < "$potential_file" 2>/dev/null || echo "0")
+        
+        if [ "$package_count" -eq 0 ]; then
+            continue
+        fi
+        
+        notice "Processing $package_count $package_type packages..."
+        
+        while IFS= read -r package_name; do
+            [ -z "$package_name" ] && continue
             
-            print(f"  {color}{risk}: {count} packages{Colors.RESET}")
+            processed=$((processed + 1))
+            printf "[%d/%d] " "$processed" "$total_packages"
+            notice "Analyzing: $package_name"
+            
+            # Extract deep context using ripgrep
+            local context_file="$context_dir/${package_type}_${package_name}.md"
+            printf "    Extracting context..."
+            extract_deep_context "$package_name" "$package_type" "$context_file"
+            printf "done\n"
+            
+            # Analyze with GPT-4o
+            local analysis_file="$analysis_dir/${package_type}_${package_name}.json"
+            printf "    LLM analysis..."
+            analyze_with_gpt4o "$package_name" "$package_type" "$context_file" "$analysis_file"
+            
+            if [ $? -eq 0 ]; then
+                printf "done\n"
+            else
+                printf "failed\n"
+            fi
+            
+            # Rate limiting
+            sleep 2
+            
+        done < "$potential_file"
+    done
     
-    print(f"{Colors.CYAN}{'='*70}{Colors.RESET}")
-    
-    # Show top concerns
-    critical_high = [r for r in results if r.get('risk_level') in ['Critical', 'High']]
-    if critical_high:
-        print(f"\n{Colors.BOLD}TOP CONCERNS:{Colors.RESET}")
-        for concern in critical_high[:5]:  # Show top 5
-            urgency = "🚨 " if concern.get('requires_immediate_attention') else ""
-            print(f"  {urgency}{Colors.RED}{concern['package_name']}{Colors.RESET} ({concern['package_type']})")
-            print(f"     Risk: {concern['risk_level']} | Confidence: {concern['confidence']}")
-            print(f"     Category: {concern['category']}")
-            print(f"     Justification: {concern['justification'][:100]}...")
-            print()
+    return 0
+}
 
-def main():
-    """Main execution function."""
-    if len(sys.argv) != 2:
-        print(f"Usage: python3 {sys.argv[0]} <scan_output_directory>")
-        print(f"Example: python3 {sys.argv[0]} /tmp/your-project-scan")
-        sys.exit(1)
+# Generate intelligent report
+generate_intelligent_report() {
+    local analysis_dir="$OUTPUT_DIR/analysis"
+    local report_file="$OUTPUT_DIR/dependency_triage_report_$(date +%Y%m%d_%H%M%S).md"
     
-    source_dir = sys.argv[1]
+    notice "Generating intelligent triage report..."
     
-    if not os.path.isdir(source_dir):
-        print(f"[{Colors.RED}ERROR{Colors.RESET}] Directory not found: {source_dir}")
-        sys.exit(1)
+    echo "# Dependency Confusion Triage Report" > "$report_file"
+    echo "**Generated:** $(date)" >> "$report_file"
+    echo "**Target:** $TARGET_DIR" >> "$report_file"
+    echo "**Model:** $MODEL" >> "$report_file"
+    echo "" >> "$report_file"
     
-    if not API_KEY:
-        print(f"[{Colors.RED}ERROR{Colors.RESET}] OPENAI_API_KEY environment variable required")
-        sys.exit(1)
+    local analyzed_count=0
+    local vulnerable_count=0
+    local false_positive_count=0
+    local uncertain_count=0
     
-    global USE_RIPGREP
-    USE_RIPGREP = check_for_ripgrep()
-    if USE_RIPGREP:
-        print(f"[{Colors.GREEN}INFO{Colors.RESET}] Using ripgrep for fast context search")
-    
-    print(f"[{Colors.BLUE}INFO{Colors.RESET}] Starting smart dependency triage...")
-    print(f"[{Colors.BLUE}INFO{Colors.RESET}] Analyzing: {Colors.BOLD}{source_dir}{Colors.RESET}")
-    
-    # Phase 1: Project Analysis
-    print(f"[{Colors.BLUE}INFO{Colors.RESET}] Analyzing project characteristics...")
-    project_info = detect_project_type(source_dir)
-    print(f"       Type: {project_info['type']}")
-    print(f"       Ecosystems: {', '.join(project_info['ecosystems'])}")
-    print(f"       Private Registry: {project_info['has_private_registry_config']}")
-    
-    # Phase 2: Load Packages
-    packages = load_potential_packages(source_dir)
-    if not packages:
-        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] No potential packages found")
-        sys.exit(0)
-    
-    print(f"[{Colors.BLUE}INFO{Colors.RESET}] Found {len(packages)} packages to analyze")
-    
-    # Phase 3: Smart Analysis
-    results = []
-    for i, (package_name, package_type) in enumerate(packages, 1):
-        print(f"[{Colors.BLUE}INFO{Colors.RESET}] Progress: {i}/{len(packages)}")
+    # Process all analysis files
+    for analysis_file in "$analysis_dir"/*.json; do
+        if [ ! -f "$analysis_file" ]; then
+            continue
+        fi
         
-        # Gather context
-        contexts = find_package_context(package_name, source_dir)
+        analyzed_count=$((analyzed_count + 1))
+        local package_name
+        package_name=$(basename "$analysis_file" .json | sed 's/^[^_]*_//')
+        local package_type
+        package_type=$(basename "$analysis_file" .json | sed 's/_.*$//')
         
-        # Analyze with LLM
-        analysis = analyze_package_with_llm(package_name, package_type, project_info, contexts)
+        local analysis_content
+        analysis_content=$(cat "$analysis_file")
         
-        if analysis:
-            results.append(analysis)
-        else:
-            # Fallback analysis for failed attempts
-            results.append({
-                'package_name': package_name,
-                'package_type': package_type,
-                'risk_level': 'Unknown',
-                'category': 'Analysis Failed',
-                'confidence': 'Low',
-                'justification': 'LLM analysis failed',
-                'recommendation': 'Manual review required',
-                'requires_immediate_attention': False,
-                'contexts_analyzed': len(contexts)
-            })
+        # Try to parse the JSON analysis
+        local risk_level
+        risk_level=$(echo "$analysis_content" | jq -r '.risk_level // .assessment // .vulnerability' 2>/dev/null || echo "unknown")
         
-        # Rate limiting
-        time.sleep(RATE_LIMIT_DELAY)
+        # Basic classification based on content analysis
+        if echo "$analysis_content" | grep -qi "vulnerable\|critical\|high.*risk\|dependency.*confusion"; then
+            vulnerable_count=$((vulnerable_count + 1))
+            echo "## 🔴 $package_name ($package_type)" >> "$report_file"
+        elif echo "$analysis_content" | grep -qi "false.*positive\|not.*vulnerable\|safe\|workspace\|local.*path\|git.*url\|private.*registry"; then
+            false_positive_count=$((false_positive_count + 1))
+            echo "## ✅ $package_name ($package_type)" >> "$report_file"
+        else
+            uncertain_count=$((uncertain_count + 1))
+            echo "## ⚠️  $package_name ($package_type)" >> "$report_file"
+        fi
+        
+        echo '```json' >> "$report_file"
+        echo "$analysis_content" | jq '.' 2>/dev/null || echo "$analysis_content" >> "$report_file"
+        echo '```' >> "$report_file"
+        echo "" >> "$report_file"
+    done
     
-    # Phase 4: Reporting
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    report_dir = os.path.join(source_dir, "smart_analysis")
-    os.makedirs(report_dir, exist_ok=True)
+    # Summary
+    echo "# Executive Summary" >> "$report_file"
+    echo "" >> "$report_file"
+    echo "| Category | Count | Percentage |" >> "$report_file"
+    echo "|----------|-------|------------|" >> "$report_file"
+    echo "| 🔴 Potentially Vulnerable | $vulnerable_count | $(echo "scale=1; $vulnerable_count * 100 / $analyzed_count" | bc)% |" >> "$report_file"
+    echo "| ✅ False Positives | $false_positive_count | $(echo "scale=1; $false_positive_count * 100 / $analyzed_count" | bc)% |" >> "$report_file"
+    echo "| ⚠️  Uncertain/Manual Review | $uncertain_count | $(echo "scale=1; $uncertain_count * 100 / $analyzed_count" | bc)% |" >> "$report_file"
+    echo "| **Total Analyzed** | **$analyzed_count** | **100%** |" >> "$report_file"
+    echo "" >> "$report_file"
     
-    report_path = os.path.join(report_dir, f"dependency_analysis_{timestamp}.csv")
-    generate_comprehensive_report(results, report_path, project_info)
+    success "Comprehensive report generated: $report_file"
     
-    # Final Summary
-    print_intelligent_summary(results, project_info)
-    
-    print(f"\n[{Colors.GREEN}SUCCESS{Colors.RESET}] Smart triage completed!")
-    print(f"[{Colors.GREEN}INFO{Colors.RESET}] Detailed report: {report_path}")
+    # Terminal summary
+    echo
+    warn "=== TRIAGE SUMMARY ==="
+    printf "🔴 Potentially Vulnerable: \e[1;31m%d\e[0m\n" "$vulnerable_count"
+    printf "✅ False Positives: \e[1;32m%d\e[0m\n" "$false_positive_count" 
+    printf "⚠️  Need Manual Review: \e[1;33m%d\e[0m\n" "$uncertain_count"
+    printf "📊 Total Analyzed: \e[1;34m%d\e[0m\n" "$analyzed_count"
+    echo
+}
 
-if __name__ == "__main__":
-    main()
+# Main execution
+main() {
+    notice "Starting advanced dependency triage with GPT-4o..."
+    notice "Using ripgrep for deep context analysis..."
+    
+    if process_potential_packages; then
+        generate_intelligent_report
+        success "Advanced triage completed successfully!"
+        notice "Full analysis available in: $OUTPUT_DIR"
+        notice "Context files: $OUTPUT_DIR/contexts/"
+        notice "LLM analysis: $OUTPUT_DIR/analysis/"
+    else
+        err "Triage process failed"
+        exit 1
+    fi
+}
+
+main "$@"
