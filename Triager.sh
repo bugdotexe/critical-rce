@@ -1,12 +1,17 @@
 #!/bin/bash
 
-# Smart Dependency Confusion Triager v2.0
-# Uses GPT-4o and ripgrep for deep context analysis
+# Smart Dependency Confusion Triager v2.1
+# Fixed version with better error handling and sanitization
 
 notice() { printf '\e[1;34m[INFO]\e[0m %s\n' "$*"; }
 warn()   { printf '\e[1;33m[WARN]\e[0m %s\n' "$*"; }
 err()    { printf '\e[1;31m[ERROR]\e[0m %s\n' "$*"; }
 success() { printf '\e[1;32m[SUCCESS]\e[0m %s\n' "$*"; }
+
+# Sanitize filename
+sanitize_filename() {
+    echo "$1" | sed 's/[^a-zA-Z0-9._-]/_/g'
+}
 
 # Check dependencies
 check_deps() {
@@ -29,7 +34,7 @@ check_deps() {
 # Parse arguments
 TARGET_DIR=""
 OUTPUT_DIR=""
-MODEL="gpt-4o"  # Latest model as of 2024
+MODEL="gpt-4o"
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -75,6 +80,9 @@ extract_deep_context() {
     local package_type="$2"
     local context_file="$3"
     
+    # Create directory if it doesn't exist
+    mkdir -p "$(dirname "$context_file")"
+    
     echo "# Deep Context Analysis for: $package_name ($package_type)" > "$context_file"
     echo "## Analysis Date: $(date)" >> "$context_file"
     echo "" >> "$context_file"
@@ -84,7 +92,7 @@ extract_deep_context() {
     
     echo "## Repository Structure Overview" >> "$context_file"
     echo '```' >> "$context_file"
-    find "$TARGET_DIR" -type f -name "*.json" -o -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.rb" -o -name "*.go" -o -name "*.java" -o -name "*.toml" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.txt" | \
+    find "$TARGET_DIR" -type f \( -name "*.json" -o -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.rb" -o -name "*.go" -o -name "*.java" -o -name "*.toml" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.txt" \) 2>/dev/null | \
         head -50 | sed "s|$TARGET_DIR/||" >> "$context_file"
     echo '```' >> "$context_file"
     echo "" >> "$context_file"
@@ -92,7 +100,7 @@ extract_deep_context() {
     echo "## All Code References (ripgrep analysis)" >> "$context_file"
     echo '```' >> "$context_file"
     rg --color=never --no-heading --line-number --max-count=50 --type=json --type=js --type=ts --type=py --type=rb --type=go --type=java --type=toml --type=yaml --type=yml --type=md --type=txt "$escaped_pkg" "$TARGET_DIR" 2>/dev/null | \
-        head -100 >> "$context_file"
+        head -100 >> "$context_file" 2>/dev/null
     echo '```' >> "$context_file"
     echo "" >> "$context_file"
     
@@ -104,14 +112,18 @@ extract_deep_context() {
             rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "package.json" 2>/dev/null | while read -r file; do
                 echo "**File:** $file" >> "$context_file"
                 echo '```json' >> "$context_file"
-                jq 'with_entries(select([.key] | inside(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"])))' "$file" 2>/dev/null | \
-                    grep -A2 -B2 "$package_name" >> "$context_file" || \
-                    rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                if command -v jq >/dev/null 2>&1; then
+                    jq 'with_entries(select([.key] | inside(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"])))' "$file" 2>/dev/null | \
+                        grep -A2 -B2 "$package_name" >> "$context_file" 2>/dev/null || \
+                        rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file" 2>/dev/null
+                else
+                    rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file" 2>/dev/null
+                fi
                 echo '```' >> "$context_file"
             done
             
             echo "### Workspace Configuration:" >> "$context_file"
-            rg --color=never -A2 -B2 "workspace:" "$TARGET_DIR" -g "package.json" 2>/dev/null >> "$context_file"
+            rg --color=never -A2 -B2 "workspace:" "$TARGET_DIR" -g "package.json" 2>/dev/null >> "$context_file" 2>/dev/null
             ;;
             
         "pip")
@@ -120,7 +132,7 @@ extract_deep_context() {
             rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "requirements*.txt" -g "Pipfile" -g "pyproject.toml" -g "setup.py" 2>/dev/null | while read -r file; do
                 echo "**File:** $file" >> "$context_file"
                 echo '```' >> "$context_file"
-                rg --color=never -A2 -B2 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                rg --color=never -A2 -B2 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file" 2>/dev/null
                 echo '```' >> "$context_file"
             done
             ;;
@@ -130,7 +142,7 @@ extract_deep_context() {
             rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "Gemfile" -g "*.gemspec" 2>/dev/null | while read -r file; do
                 echo "**File:** $file" >> "$context_file"
                 echo '```ruby' >> "$context_file"
-                rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                rg --color=never -A3 -B3 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file" 2>/dev/null
                 echo '```' >> "$context_file"
             done
             ;;
@@ -140,7 +152,7 @@ extract_deep_context() {
             rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "go.mod" 2>/dev/null | while read -r file; do
                 echo "**File:** $file" >> "$context_file"
                 echo '```go' >> "$context_file"
-                rg --color=never -A2 -B2 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                rg --color=never -A2 -B2 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file" 2>/dev/null
                 echo '```' >> "$context_file"
             done
             ;;
@@ -150,7 +162,7 @@ extract_deep_context() {
             rg --color=never -l "$escaped_pkg" "$TARGET_DIR" -g "pom.xml" 2>/dev/null | while read -r file; do
                 echo "**File:** $file" >> "$context_file"
                 echo '```xml' >> "$context_file"
-                rg --color=never -A5 -B5 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file"
+                rg --color=never -A5 -B5 "$escaped_pkg" "$file" 2>/dev/null >> "$context_file" 2>/dev/null
                 echo '```' >> "$context_file"
             done
             ;;
@@ -159,24 +171,32 @@ extract_deep_context() {
     # Source analysis
     echo "## Source Analysis" >> "$context_file"
     echo "### Git URLs:" >> "$context_file"
-    rg --color=never -A1 -B1 "git.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file"
+    rg --color=never -A1 -B1 "git.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file" 2>/dev/null
     
     echo "### Local Paths:" >> "$context_file"
-    rg --color=never -A1 -B1 "file:.*$escaped_pkg\|path:.*$escaped_pkg\|\.\/.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file"
+    rg --color=never -A1 -B1 "file:.*$escaped_pkg\|path:.*$escaped_pkg\|\.\/.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file" 2>/dev/null
     
     echo "### Private Registries:" >> "$context_file"
-    rg --color=never -A1 -B1 "registry.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file"
+    rg --color=never -A1 -B1 "registry.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -20 >> "$context_file" 2>/dev/null
     
     echo "## Import/Usage Patterns" >> "$context_file"
-    rg --color=never -A2 -B2 "import.*$escaped_pkg\|require.*$escaped_pkg\|from.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -30 >> "$context_file"
+    rg --color=never -A2 -B2 "import.*$escaped_pkg\|require.*$escaped_pkg\|from.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -30 >> "$context_file" 2>/dev/null
 }
 
-# LLM analysis with contextual decision making
+# LLM analysis with better error handling
 analyze_with_gpt4o() {
     local package_name="$1"
     local package_type="$2"
     local context_file="$3"
     local output_file="$4"
+    
+    # Create directory if it doesn't exist
+    mkdir -p "$(dirname "$output_file")"
+    
+    if [ ! -f "$context_file" ]; then
+        err "Context file not found: $context_file"
+        return 1
+    fi
     
     local context_content
     context_content=$(cat "$context_file")
@@ -223,19 +243,35 @@ Provide a thorough analysis based on the evidence found in the codebase context.
             \"response_format\": { \"type\": \"json_object\" },
             \"temperature\": 0.1,
             \"max_tokens\": 1500
-        }")
+        }" 2>/dev/null)
     
-    if [ $? -eq 0 ] && [ -n "$response" ]; then
-        local analysis
-        analysis=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
-        if [ -n "$analysis" ] && [ "$analysis" != "null" ]; then
-            echo "$analysis" > "$output_file"
-            return 0
-        fi
+    if [ $? -ne 0 ]; then
+        err "API call failed for $package_name"
+        return 1
     fi
     
-    err "LLM analysis failed for $package_name"
-    return 1
+    if [ -z "$response" ]; then
+        err "Empty response for $package_name"
+        return 1
+    fi
+    
+    # Check for API errors
+    local error_msg
+    error_msg=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+    if [ -n "$error_msg" ]; then
+        err "API error for $package_name: $error_msg"
+        return 1
+    fi
+    
+    local analysis
+    analysis=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
+    if [ -n "$analysis" ] && [ "$analysis" != "null" ]; then
+        echo "$analysis" > "$output_file"
+        return 0
+    else
+        err "Failed to extract analysis for $package_name"
+        return 1
+    fi
 }
 
 # Process all potential packages
@@ -256,6 +292,8 @@ process_potential_packages() {
     
     local total_packages=0
     local processed=0
+    local success_count=0
+    local fail_count=0
     
     # Count total packages
     for potential_file in "$dep_dir"/*.potential; do
@@ -297,29 +335,39 @@ process_potential_packages() {
             printf "[%d/%d] " "$processed" "$total_packages"
             notice "Analyzing: $package_name"
             
+            # Sanitize package name for filename
+            local safe_name
+            safe_name=$(sanitize_filename "$package_name")
+            
             # Extract deep context using ripgrep
-            local context_file="$context_dir/${package_type}_${package_name}.md"
+            local context_file="$context_dir/${package_type}_${safe_name}.md"
             printf "    Extracting context..."
-            extract_deep_context "$package_name" "$package_type" "$context_file"
-            printf "done\n"
-            
-            # Analyze with GPT-4o
-            local analysis_file="$analysis_dir/${package_type}_${package_name}.json"
-            printf "    LLM analysis..."
-            analyze_with_gpt4o "$package_name" "$package_type" "$context_file" "$analysis_file"
-            
-            if [ $? -eq 0 ]; then
+            if extract_deep_context "$package_name" "$package_type" "$context_file"; then
                 printf "done\n"
             else
                 printf "failed\n"
+                fail_count=$((fail_count + 1))
+                continue
+            fi
+            
+            # Analyze with GPT-4o
+            local analysis_file="$analysis_dir/${package_type}_${safe_name}.json"
+            printf "    LLM analysis..."
+            if analyze_with_gpt4o "$package_name" "$package_type" "$context_file" "$analysis_file"; then
+                printf "done\n"
+                success_count=$((success_count + 1))
+            else
+                printf "failed\n"
+                fail_count=$((fail_count + 1))
             fi
             
             # Rate limiting
-            sleep 2
+            sleep 3
             
         done < "$potential_file"
     done
     
+    notice "Analysis completed: $success_count successful, $fail_count failed"
     return 0
 }
 
@@ -348,17 +396,19 @@ generate_intelligent_report() {
         fi
         
         analyzed_count=$((analyzed_count + 1))
-        local package_name
-        package_name=$(basename "$analysis_file" .json | sed 's/^[^_]*_//')
+        local filename
+        filename=$(basename "$analysis_file" .json)
         local package_type
-        package_type=$(basename "$analysis_file" .json | sed 's/_.*$//')
+        package_type=$(echo "$filename" | sed 's/_.*$//')
+        local package_name
+        package_name=$(echo "$filename" | sed 's/^[^_]*_//')
         
         local analysis_content
         analysis_content=$(cat "$analysis_file")
         
         # Try to parse the JSON analysis
         local risk_level
-        risk_level=$(echo "$analysis_content" | jq -r '.risk_level // .assessment // .vulnerability' 2>/dev/null || echo "unknown")
+        risk_level=$(echo "$analysis_content" | jq -r '.risk_level // .assessment // .vulnerability // "unknown"' 2>/dev/null || echo "unknown")
         
         # Basic classification based on content analysis
         if echo "$analysis_content" | grep -qi "vulnerable\|critical\|high.*risk\|dependency.*confusion"; then
@@ -373,7 +423,11 @@ generate_intelligent_report() {
         fi
         
         echo '```json' >> "$report_file"
-        echo "$analysis_content" | jq '.' 2>/dev/null || echo "$analysis_content" >> "$report_file"
+        if command -v jq >/dev/null 2>&1; then
+            echo "$analysis_content" | jq '.' 2>/dev/null >> "$report_file" || echo "$analysis_content" >> "$report_file"
+        else
+            echo "$analysis_content" >> "$report_file"
+        fi
         echo '```' >> "$report_file"
         echo "" >> "$report_file"
     done
@@ -383,9 +437,24 @@ generate_intelligent_report() {
     echo "" >> "$report_file"
     echo "| Category | Count | Percentage |" >> "$report_file"
     echo "|----------|-------|------------|" >> "$report_file"
-    echo "| 🔴 Potentially Vulnerable | $vulnerable_count | $(echo "scale=1; $vulnerable_count * 100 / $analyzed_count" | bc)% |" >> "$report_file"
-    echo "| ✅ False Positives | $false_positive_count | $(echo "scale=1; $false_positive_count * 100 / $analyzed_count" | bc)% |" >> "$report_file"
-    echo "| ⚠️  Uncertain/Manual Review | $uncertain_count | $(echo "scale=1; $uncertain_count * 100 / $analyzed_count" | bc)% |" >> "$report_file"
+    
+    if [ "$analyzed_count" -gt 0 ]; then
+        local vulnerable_pct
+        vulnerable_pct=$(echo "scale=1; $vulnerable_count * 100 / $analyzed_count" | bc 2>/dev/null || echo "0")
+        local false_positive_pct
+        false_positive_pct=$(echo "scale=1; $false_positive_count * 100 / $analyzed_count" | bc 2>/dev/null || echo "0")
+        local uncertain_pct
+        uncertain_pct=$(echo "scale=1; $uncertain_count * 100 / $analyzed_count" | bc 2>/dev/null || echo "0")
+        
+        echo "| 🔴 Potentially Vulnerable | $vulnerable_count | ${vulnerable_pct}% |" >> "$report_file"
+        echo "| ✅ False Positives | $false_positive_count | ${false_positive_pct}% |" >> "$report_file"
+        echo "| ⚠️  Uncertain/Manual Review | $uncertain_count | ${uncertain_pct}% |" >> "$report_file"
+    else
+        echo "| 🔴 Potentially Vulnerable | 0 | 0% |" >> "$report_file"
+        echo "| ✅ False Positives | 0 | 0% |" >> "$report_file"
+        echo "| ⚠️  Uncertain/Manual Review | 0 | 0% |" >> "$report_file"
+    fi
+    
     echo "| **Total Analyzed** | **$analyzed_count** | **100%** |" >> "$report_file"
     echo "" >> "$report_file"
     
