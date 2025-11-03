@@ -1,112 +1,114 @@
-#!/usr/bin/env python3
-
-"""
-Contextual LLM Decision Maker for Dependency Confusion (using OpenAI) - v10.2
-
-This standalone script delegates all decision-making to the LLM.
-It does not "teach" the LLM rules, it treats the LLM as an expert.
-
-1.  It automatically detects and uses 'ripgrep' (rg) for fast context search.
-2.  It uses the '-F' (fixed-strings) flag for accurate, fast searches.
-3.  It strips ANSI color codes from input files.
-4.  It finds *all* context for *every* package.
-5.  It passes the evidence to a new, simplified "Expert Analyst" prompt.
-6.  The LLM uses its own vast, built-in knowledge to make a final,
-    expert determination.
-
-Usage:
-    python3 LLM_Triager.py /path/to/my/project
-    (e.g., python3 LLM_Triager.py /tmp/elastic)
-"""
-
-import os
-import sys
-import json
-import time
-import requests # You may need to install this: pip install requests
-import csv
-import subprocess
-import re
-import shutil
-from typing import List, Dict, Optional, Any
-
-# --- Configuration ---
-
-API_KEY = os.environ.get("OPENAI_API_KEY")
-API_URL = "https://api.openai.com/v1/chat/completions"
-MODEL_NAME = "gpt-4o"
-SEARCH_TIMEOUT = 15 # Timeout for each rg/grep command
-
-# ANSI color codes for summary
-class Colors:
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    RED = '\033[1;31m'
-    GREEN = '\033[1;32m'
-    YELLOW = '\033[1;33m'
-    BLUE = '\033[1;34m'
-    WHITE = '\033[1;37m'
-    GREY = '\033[0;37m'
-
-# This will be set to True if 'rg' is found
-USE_RIPGREP = False
-
-# --- V10 "EXPERT ANALYST" SYSTEM PROMPT ---
-# This prompt provides a role and a task, not a list of rules.
-# It trusts the LLM to be the expert.
+# --- v10.3 Enhanced "Expert Analyst" Prompt ---
 SYSTEM_PROMPT = """
-You are a principal cybersecurity analyst at a top-tier security firm. Your sole focus is on supply chain security, specifically dependency confusion and repository takeovers.
+You are a principal cybersecurity analyst specializing in supply chain security.
+You triage dependency confusion findings for large organizations.
 
-You are given a case file for a single package. This package is *already confirmed* to be available for registration on a public registry (like npm, PyPI, etc.).
+Each package listed here is *confirmed to be publicly unregistered*.
+Your job is to decide whether this represents a **Potential Vulnerability** or a **False Positive**.
 
-Your case file contains:
-1.  `package_name`: The name of the available package.
-2.  `package_type`: The ecosystem (e.g., "npm", "pip", "github").
-3.  `home_org`: The name of the client organization we are auditing (e.g., "elastic").
-4.  `context_snippets`: A list of code snippets from the client's codebase where this package name was found.
+Analyze the provided context carefully. The context contains real source code snippets and filenames where this dependency name appears.
 
-**Your Task:**
-Analyze all the evidence. Use your expert knowledge to decide if this is a **Potential Vulnerability** or a **False Positive**.
+Your reasoning should integrate these layers:
+1. **Package semantics** – is the name brand-specific, internal, or generic?
+2. **Ecosystem norms** – e.g., npm scopes (@org/package) vs. PyPI vs. GitHub.
+3. **Contextual indicators** – e.g., mentions of "private", "internal", "local", "workspace", "git+https://", or company-specific paths.
+4. **Likelihood of exposure** – whether the dependency looks like it’s used as a real dependency versus just a reference, test mock, or example.
 
--   **A "Potential Vulnerability" is:**
-    -   Classic dependency confusion (e.g., a package like `elastic-internal-tool` or `@elastic/auth` used without a private source).
-    -   Scope takeover (e.g., a generic, unregistered scope like `@my-scope/package`).
-    -   Repo takeover (e.g., a `github` type package pointing to a deleted user).
+Use your expertise and evidence to classify it.
 
--   **A "False Positive" is:**
-    -   A public, third-party package (e.g., `@babel/parser`, `sphinx_rtd_theme`).
-    -   A package explicitly sourced from elsewhere (e.g., context shows `"dependency": "github:..."` or `"workspace:..."`).
-    -   A random string that happens to match the name.
+Respond with strict JSON:
 
-**Response Format:**
-Deliver your final analysis as a *single JSON object* and nothing else.
 {
   "package_name": "string",
-  "classification": "string (must be 'Potential Vulnerability' or 'False Positive')",
-  "justification": "string (Your concise, expert justification for your decision. 1-2 sentences.)",
-  "highest_risk_context": "string (The single best line of evidence. If no good evidence, write 'N/A'.)"
+  "classification": "Potential Vulnerability" | "False Positive",
+  "justification": "1-2 concise expert sentences justifying your decision.",
+  "highest_risk_context": "Best single line of evidence, or 'N/A'.",
+  "risk_signals": ["list of brief signals or indicators you noticed"]
 }
 """
 
-# --- Functions ---
+def analyze_with_llm(package_name: str, package_type: str, home_org: str, context_list: List[Dict[str, Any]], max_retries: int = 3) -> Optional[Dict[str, Any]]:
+    """
+    Calls the OpenAI API to analyze the package with enhanced signal extraction.
+    """
+    print(f"  [{Colors.BLUE}LLM{Colors.RESET}] Analyzing {package_type} package: {Colors.BOLD}{package_name}{Colors.RESET} (with {len(context_list)} context snippets)")
 
-def check_for_ripgrep() -> bool:
-    """Checks if 'rg' (ripgrep) is in the system PATH."""
-    if shutil.which("rg"):
-        print(f"[{Colors.GREEN}INFO{Colors.RESET}] 'ripgrep' (rg) detected. Using for fast search.")
-        return True
-    else:
-        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] 'ripgrep' (rg) not found in PATH.")
-        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] Falling back to 'grep'. For large projects, this may be slow or time out.")
-        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] Recommend installing ripgrep for a massive speed improvement.")
-        return False
+    # --- Context preprocessing / heuristic hints ---
+    flags = []
+    lname = package_name.lower()
+    if lname.startswith('@') or '/' in lname:
+        flags.append("scoped_or_namespaced_package")
+    if any(k in lname for k in ["internal", "private", "conf", "corp", "secure", "intranet"]):
+        flags.append("internal_naming_pattern")
+    if lname.startswith(home_org.lower()) or lname.endswith(home_org.lower()):
+        flags.append("organization_branded_name")
 
-def strip_ansi_codes(text: str) -> str:
-    """Removes ANSI escape codes (like colors) from a string."""
-    if not text:
-        return ""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', text)
+    evidence_lines = [c["content"] for c in context_list if "content" in c]
+    # Remove duplicate or near-identical lines
+    unique_lines = list({line.strip(): None for line in evidence_lines}.keys())[:15]
+
+    # Extract hints from context
+    context_text = "\n".join(unique_lines)
+    if re.search(r"(workspace|git\+https|github|file:|local:|relative)", context_text, re.I):
+        flags.append("explicit_private_source_detected")
+    if re.search(r"(import|require|from\s+['\"])", context_text):
+        flags.append("appears_to_be_imported")
+    if not context_text.strip():
+        flags.append("no_source_context_found")
+
+    # Build context JSON
+    context_str = json.dumps(context_list[:20], indent=2) if context_list else "[]"
+
+    # Merge everything into a single query
+    user_query = f"""
+    Organization: {home_org}
+    Package name: {package_name}
+    Package type: {package_type}
+    Observed signals: {flags}
+
+    Source evidence:
+    {context_str}
+
+    Use all information above to classify this package according to the JSON format described.
+    """
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_query}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {API_KEY}'
+    }
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                json_text = result.get('choices', [{}])[0].get('message', {}).get('content', '{}')
+                analysis = json.loads(json_text)
+                analysis['package_type'] = package_type
+                analysis['flags_detected'] = flags
+                return analysis
+            else:
+                print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] API request failed ({response.status_code}): {response.text}")
+                if 400 <= response.status_code < 500: 
+                    return None
+        except requests.RequestException as e:
+            print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] API request exception: {e}")
+
+        wait = (2 ** attempt)
+        print(f"    [{Colors.BLUE}INFO{Colors.RESET}] Retrying in {wait}s...")
+        time.sleep(wait)
+
+    print(f"    [{Colors.RED}ERROR{Colors.RESET}] Failed to analyze '{package_name}' after {max_retries} attempts.")
+    return None
 
 def run_search(pattern: str, search_dir: str, line_numbers: bool, case_insensitive: bool, fixed_string: bool) -> str:
     """
