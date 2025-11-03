@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Smart Dependency Confusion Triager v2.1
-# Fixed version with better error handling and sanitization
+# Smart Dependency Confusion Triager v2.2
+# Fixed JSON escaping issues
 
 notice() { printf '\e[1;34m[INFO]\e[0m %s\n' "$*"; }
 warn()   { printf '\e[1;33m[WARN]\e[0m %s\n' "$*"; }
@@ -183,7 +183,7 @@ extract_deep_context() {
     rg --color=never -A2 -B2 "import.*$escaped_pkg\|require.*$escaped_pkg\|from.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -30 >> "$context_file" 2>/dev/null
 }
 
-# LLM analysis with better error handling
+# LLM analysis with proper JSON escaping
 analyze_with_gpt4o() {
     local package_name="$1"
     local package_type="$2"
@@ -201,8 +201,12 @@ analyze_with_gpt4o() {
     local context_content
     context_content=$(cat "$context_file")
     
-    # Smart prompt that lets the model reason based on context
-    local prompt="Analyze this dependency confusion scenario based on the comprehensive codebase context provided.
+    # Create a temporary file for the JSON payload
+    local temp_json
+    temp_json=$(mktemp)
+    
+    # Build JSON payload using jq for proper escaping
+    jq -n --arg model "$MODEL" --arg system_content "You are a senior security engineer with deep expertise in dependency management and supply chain security. Analyze codebase context thoroughly and provide evidence-based assessments. Focus on actual usage patterns and sourcing methods found in the code." --arg user_content "Analyze this dependency confusion scenario based on the comprehensive codebase context provided.
 
 ## Package Information
 - Name: $package_name
@@ -222,31 +226,40 @@ Consider:
 - Whether this appears to be an internal package or public dependency
 - Any workspace, local path, or private registry configurations
 
-Provide a thorough analysis based on the evidence found in the codebase context."
-
+Provide a thorough analysis based on the evidence found in the codebase context." '{
+        model: $model,
+        messages: [
+            {
+                role: "system",
+                content: $system_content
+            },
+            {
+                role: "user", 
+                content: $user_content
+            }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1,
+        max_tokens: 1500
+    }' > "$temp_json"
+    
+    if [ $? -ne 0 ]; then
+        err "Failed to create JSON payload for $package_name"
+        rm -f "$temp_json"
+        return 1
+    fi
+    
     local response
     response=$(curl -s -X POST "https://api.openai.com/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $OPENAI_API_KEY" \
-        -d "{
-            \"model\": \"$MODEL\",
-            \"messages\": [
-                {
-                    \"role\": \"system\", 
-                    \"content\": \"You are a senior security engineer with deep expertise in dependency management and supply chain security. Analyze codebase context thoroughly and provide evidence-based assessments. Focus on actual usage patterns and sourcing methods found in the code.\"
-                },
-                {
-                    \"role\": \"user\", 
-                    \"content\": \"$prompt\"
-                }
-            ],
-            \"response_format\": { \"type\": \"json_object\" },
-            \"temperature\": 0.1,
-            \"max_tokens\": 1500
-        }" 2>/dev/null)
+        -d "@$temp_json" 2>/dev/null)
     
-    if [ $? -ne 0 ]; then
-        err "API call failed for $package_name"
+    local curl_exit=$?
+    rm -f "$temp_json"
+    
+    if [ $curl_exit -ne 0 ]; then
+        err "API call failed for $package_name (curl exit: $curl_exit)"
         return 1
     fi
     
@@ -350,6 +363,15 @@ process_potential_packages() {
                 continue
             fi
             
+            # Check context file size - if too large, truncate
+            local context_size
+            context_size=$(wc -c < "$context_file" 2>/dev/null || echo 0)
+            if [ "$context_size" -gt 20000 ]; then
+                warn "    Context file too large ($context_size bytes), truncating..."
+                head -c 15000 "$context_file" > "${context_file}.tmp" && mv "${context_file}.tmp" "$context_file"
+                echo "...[truncated]" >> "$context_file"
+            fi
+            
             # Analyze with GPT-4o
             local analysis_file="$analysis_dir/${package_type}_${safe_name}.json"
             printf "    LLM analysis..."
@@ -362,7 +384,7 @@ process_potential_packages() {
             fi
             
             # Rate limiting
-            sleep 3
+            sleep 2
             
         done < "$potential_file"
     done
@@ -411,10 +433,10 @@ generate_intelligent_report() {
         risk_level=$(echo "$analysis_content" | jq -r '.risk_level // .assessment // .vulnerability // "unknown"' 2>/dev/null || echo "unknown")
         
         # Basic classification based on content analysis
-        if echo "$analysis_content" | grep -qi "vulnerable\|critical\|high.*risk\|dependency.*confusion"; then
+        if echo "$analysis_content" | grep -qi "\"risk_level\":\"CRITICAL\"\|\"risk_level\":\"HIGH\"\|vulnerable\|critical\|high.*risk\|dependency.*confusion"; then
             vulnerable_count=$((vulnerable_count + 1))
             echo "## 🔴 $package_name ($package_type)" >> "$report_file"
-        elif echo "$analysis_content" | grep -qi "false.*positive\|not.*vulnerable\|safe\|workspace\|local.*path\|git.*url\|private.*registry"; then
+        elif echo "$analysis_content" | grep -qi "\"risk_level\":\"LOW\"\|\"risk_level\":\"NONE\"\|false.*positive\|not.*vulnerable\|safe\|workspace\|local.*path\|git.*url\|private.*registry"; then
             false_positive_count=$((false_positive_count + 1))
             echo "## ✅ $package_name ($package_type)" >> "$report_file"
         else
