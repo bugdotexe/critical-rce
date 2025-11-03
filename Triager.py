@@ -1,114 +1,173 @@
-# --- v10.3 Enhanced "Expert Analyst" Prompt ---
+#!/usr/bin/env python3
+
+"""
+Contextual LLM Decision Maker for Dependency Confusion (using OpenAI) - v10.2
+
+This standalone script delegates all decision-making to the LLM.
+It does not "teach" the LLM rules, it treats the LLM as an expert.
+
+1.  It automatically detects and uses 'ripgrep' (rg) for fast context search.
+2.  It uses the '-F' (fixed-strings) flag for accurate, fast searches.
+3.  It strips ANSI color codes from input files.
+4.  It finds *all* context for *every* package.
+5.  It passes the evidence to a new, simplified "Expert Analyst" prompt.
+6.  The LLM uses its own vast, built-in knowledge to make a final,
+    expert determination.
+
+Usage:
+    python3 LLM_Triager.py /path/to/my/project
+    (e.g., python3 LLM_Triager.py /tmp/elastic)
+"""
+
+import os
+import sys
+import json
+import time
+import requests
+import csv
+import subprocess
+import re
+import shutil
+import shlex
+from typing import List, Dict, Optional, Any
+
+# --- Configuration ---
+
+API_KEY = os.environ.get("OPENAI_API_KEY")
+API_URL = "https://api.openai.com/v1/chat/completions"
+MODEL_NAME = "gpt-4o"
+SEARCH_TIMEOUT = 15  # Timeout for each rg/grep command
+
+# ANSI color codes for summary
+class Colors:
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    RED = '\033[1;31m'
+    GREEN = '\033[1;32m'
+    YELLOW = '\033[1;33m'
+    BLUE = '\033[1;34m'
+    WHITE = '\033[1;37m'
+    GREY = '\033[0;37m'
+
+# This will be set to True if 'rg' is found
+USE_RIPGREP = False
+
+# --- V10 "EXPERT ANALYST" SYSTEM PROMPT ---
+# This prompt provides a role and a task, not a list of rules.
+# It trusts the LLM to be the expert.
 SYSTEM_PROMPT = """
-You are a principal cybersecurity analyst specializing in supply chain security.
-You triage dependency confusion findings for large organizations.
+You are a principal cybersecurity analyst at a top-tier security firm. Your sole focus is on supply chain security, specifically dependency confusion and repository takeovers.
 
-Each package listed here is *confirmed to be publicly unregistered*.
-Your job is to decide whether this represents a **Potential Vulnerability** or a **False Positive**.
+You are given a case file for a single package. This package is *already confirmed* to be available for registration on a public registry (like npm, PyPI, etc.).
 
-Analyze the provided context carefully. The context contains real source code snippets and filenames where this dependency name appears.
+Your case file contains:
+1.  `package_name`: The name of the available package.
+2.  `package_type`: The ecosystem (e.g., "npm", "pip", "github").
+3.  `home_org`: The name of the client organization we are auditing (e.g., "elastic").
+4.  `context_snippets`: A list of code snippets from the client's codebase where this package name was found.
 
-Your reasoning should integrate these layers:
-1. **Package semantics** – is the name brand-specific, internal, or generic?
-2. **Ecosystem norms** – e.g., npm scopes (@org/package) vs. PyPI vs. GitHub.
-3. **Contextual indicators** – e.g., mentions of "private", "internal", "local", "workspace", "git+https://", or company-specific paths.
-4. **Likelihood of exposure** – whether the dependency looks like it’s used as a real dependency versus just a reference, test mock, or example.
+**Your Task:**
+Analyze all the evidence. Use your expert knowledge to decide if this is a **Potential Vulnerability** or a **False Positive**.
 
-Use your expertise and evidence to classify it.
+-   **A "Potential Vulnerability" is:**
+    -   Classic dependency confusion (e.g., a package like `elastic-internal-tool` or `@elastic/auth` used without a private source).
+    -   Scope takeover (e.g., a generic, unregistered scope like `@my-scope/package`).
+    -   Repo takeover (e.g., a `github` type package pointing to a deleted user).
 
-Respond with strict JSON:
+-   **A "False Positive" is:**
+    -   A public, third-party package (e.g., `@babel/parser`, `sphinx_rtd_theme`).
+    -   A package explicitly sourced from elsewhere (e.g., context shows `"dependency": "github:..."` or `"workspace:..."`).
+    -   A random string that happens to match the name.
 
+**Response Format:**
+Deliver your final analysis as a *single JSON object* and nothing else.
 {
   "package_name": "string",
-  "classification": "Potential Vulnerability" | "False Positive",
-  "justification": "1-2 concise expert sentences justifying your decision.",
-  "highest_risk_context": "Best single line of evidence, or 'N/A'.",
-  "risk_signals": ["list of brief signals or indicators you noticed"]
+  "classification": "string (must be 'Potential Vulnerability' or 'False Positive')",
+  "justification": "string (Your concise, expert justification for your decision. 1-2 sentences.)",
+  "highest_risk_context": "string (The single best line of evidence. If no good evidence, write 'N/A'.)"
 }
 """
 
-def analyze_with_llm(package_name: str, package_type: str, home_org: str, context_list: List[Dict[str, Any]], max_retries: int = 3) -> Optional[Dict[str, Any]]:
-    """
-    Calls the OpenAI API to analyze the package with enhanced signal extraction.
-    """
-    print(f"  [{Colors.BLUE}LLM{Colors.RESET}] Analyzing {package_type} package: {Colors.BOLD}{package_name}{Colors.RESET} (with {len(context_list)} context snippets)")
+# --- Functions ---
 
-    # --- Context preprocessing / heuristic hints ---
-    flags = []
-    lname = package_name.lower()
-    if lname.startswith('@') or '/' in lname:
-        flags.append("scoped_or_namespaced_package")
-    if any(k in lname for k in ["internal", "private", "conf", "corp", "secure", "intranet"]):
-        flags.append("internal_naming_pattern")
-    if lname.startswith(home_org.lower()) or lname.endswith(home_org.lower()):
-        flags.append("organization_branded_name")
+def check_for_ripgrep() -> bool:
+    """Checks if 'rg' (ripgrep) is in the system PATH."""
+    if shutil.which("rg"):
+        print(f"[{Colors.GREEN}INFO{Colors.RESET}] 'ripgrep' (rg) detected. Using for fast search.")
+        return True
+    else:
+        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] 'ripgrep' (rg) not found in PATH.")
+        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] Falling back to 'grep'. For large projects, this may be slow or time out.")
+        print(f"[{Colors.YELLOW}WARN{Colors.RESET}] Recommend installing ripgrep for a massive speed improvement.")
+        return False
 
-    evidence_lines = [c["content"] for c in context_list if "content" in c]
-    # Remove duplicate or near-identical lines
-    unique_lines = list({line.strip(): None for line in evidence_lines}.keys())[:15]
+def strip_ansi_codes(text: str) -> str:
+    """Removes ANSI escape codes (like colors) from a string."""
+    if not text:
+        return ""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
-    # Extract hints from context
-    context_text = "\n".join(unique_lines)
-    if re.search(r"(workspace|git\+https|github|file:|local:|relative)", context_text, re.I):
-        flags.append("explicit_private_source_detected")
-    if re.search(r"(import|require|from\s+['\"])", context_text):
-        flags.append("appears_to_be_imported")
-    if not context_text.strip():
-        flags.append("no_source_context_found")
+def validate_package_name(package_name: str) -> bool:
+    """Basic validation of package names to prevent command injection."""
+    if not package_name or len(package_name) > 200:
+        return False
+    # Basic sanity check - should not contain obvious command injection patterns
+    dangerous_patterns = [';', '|', '&', '`', '$', '>', '<', '\n', '\r']
+    return not any(pattern in package_name for pattern in dangerous_patterns)
 
-    # Build context JSON
-    context_str = json.dumps(context_list[:20], indent=2) if context_list else "[]"
+def sanitize_context_content(content: str) -> str:
+    """Remove potentially sensitive information from context."""
+    if not content:
+        return content
+    
+    # Remove potential secrets (basic pattern matching)
+    secrets_patterns = [
+        r'password["\']?\s*:\s*["\'][^"\']+["\']',
+        r'api_key["\']?\s*:\s*["\'][^"\']+["\']',
+        r'token["\']?\s*:\s*["\'][^"\']+["\']',
+        r'secret["\']?\s*:\s*["\'][^"\']+["\']',
+    ]
+    for pattern in secrets_patterns:
+        content = re.sub(pattern, '[REDACTED]', content, flags=re.IGNORECASE)
+    return content
 
-    # Merge everything into a single query
-    user_query = f"""
-    Organization: {home_org}
-    Package name: {package_name}
-    Package type: {package_type}
-    Observed signals: {flags}
+def safe_file_read(file_path: str) -> Optional[str]:
+    """Safely read file with encoding handling."""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+    except Exception as e:
+        print(f"[{Colors.RED}ERROR{Colors.RESET}] Failed to read {file_path}: {e}")
+        return None
 
-    Source evidence:
-    {context_str}
-
-    Use all information above to classify this package according to the JSON format described.
-    """
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_query}
-        ],
-        "response_format": {"type": "json_object"}
-    }
-
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {API_KEY}'
-    }
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=60)
-            if response.status_code == 200:
-                result = response.json()
-                json_text = result.get('choices', [{}])[0].get('message', {}).get('content', '{}')
-                analysis = json.loads(json_text)
-                analysis['package_type'] = package_type
-                analysis['flags_detected'] = flags
-                return analysis
-            else:
-                print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] API request failed ({response.status_code}): {response.text}")
-                if 400 <= response.status_code < 500: 
-                    return None
-        except requests.RequestException as e:
-            print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] API request exception: {e}")
-
-        wait = (2 ** attempt)
-        print(f"    [{Colors.BLUE}INFO{Colors.RESET}] Retrying in {wait}s...")
-        time.sleep(wait)
-
-    print(f"    [{Colors.RED}ERROR{Colors.RESET}] Failed to analyze '{package_name}' after {max_retries} attempts.")
-    return None
+def filter_relevant_context(contexts: List[Dict], package_name: str, max_contexts: int = 15) -> List[Dict]:
+    """Prioritize contexts that appear most relevant."""
+    if not contexts:
+        return contexts
+    
+    scored_contexts = []
+    for ctx in contexts:
+        score = 0
+        content_lower = ctx["content"].lower()
+        
+        # Higher score for manifest files
+        if any(ext in ctx["file"].lower() for ext in ['.json', '.yml', '.yaml', '.txt', '.toml', '.lock', 'package.json', 'requirements.txt', 'pom.xml', 'build.gradle']):
+            score += 2
+        
+        # Higher score if package name appears as whole word
+        if re.search(rf'\b{re.escape(package_name)}\b', content_lower):
+            score += 3
+            
+        # Higher score for import/require statements
+        if any(keyword in content_lower for keyword in ['import', 'require', 'dependency', 'depends', 'package']):
+            score += 1
+            
+        scored_contexts.append((score, ctx))
+    
+    scored_contexts.sort(key=lambda x: x[0], reverse=True)
+    return [ctx for _, ctx in scored_contexts[:max_contexts]]
 
 def run_search(pattern: str, search_dir: str, line_numbers: bool, case_insensitive: bool, fixed_string: bool) -> str:
     """
@@ -116,6 +175,11 @@ def run_search(pattern: str, search_dir: str, line_numbers: bool, case_insensiti
     'rg' is the preferred, much faster tool.
     """
     global USE_RIPGREP
+    
+    # Validate inputs to prevent command injection
+    if not validate_package_name(pattern):
+        print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Skipping suspicious package name: {pattern[:50]}...")
+        return ""
     
     flags = ""
     if line_numbers:
@@ -126,32 +190,30 @@ def run_search(pattern: str, search_dir: str, line_numbers: bool, case_insensiti
     # Use -F for fixed_string search, -E for regex search
     search_mode_flag = "F" if fixed_string else "E"
 
-    if USE_RIPGREP:
-        # Use ripgrep
-        # We must use subprocess.list2cmdline to handle quotes in the pattern
-        cmd_list = [
-            "rg",
-            f"-{flags}{search_mode_flag}",
-            "--no-heading",
-            "--no-ignore",
-            "-g", "!llm_analysis_report.csv",
-            "-g", "!.potential",
-            pattern,
-            search_dir
-        ]
-        command = subprocess.list2cmdline(cmd_list)
-    else:
-        # Use grep
-        command = (
-            f"grep -r{flags}{search_mode_flag} \"{pattern}\" \"{search_dir}\" "
-            f"| grep -vE \"(llm_analysis_report.csv|\\.potential)\""
-        )
-
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
-        return result.stdout.strip()
+        if USE_RIPGREP:
+            # Use ripgrep with list arguments for security
+            cmd = [
+                "rg",
+                f"-{flags}{search_mode_flag}",
+                "--no-heading",
+                "--no-ignore",
+                "-g", "!llm_analysis_report.csv",
+                "-g", "!.potential",
+                pattern,
+                search_dir
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
+            return result.stdout.strip()
+        else:
+            # Use grep with shell but quoted arguments
+            grep_cmd = f"grep -r{flags}{search_mode_flag} {shlex.quote(pattern)} {shlex.quote(search_dir)}"
+            exclude_cmd = "grep -vE \"(llm_analysis_report.csv|\\.potential)\""
+            full_cmd = f"{grep_cmd} | {exclude_cmd}"
+            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
+            return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Search command timed out (>{SEARCH_TIMEOUT}s): {command.split('|')[0]}...")
+        print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Search command timed out (>{SEARCH_TIMEOUT}s) for: {pattern[:30]}...")
     except Exception as e:
         print(f"    [{Colors.RED}ERROR{Colors.RESET}] Search command failed: {e}")
     return ""
@@ -170,13 +232,13 @@ def find_all_context(package_name: str, search_dir: str) -> List[Dict[str, Any]]
         pattern, 
         search_dir, 
         line_numbers=True, 
-        case_insensitive=True, # 'rg -iF' works well
+        case_insensitive=True,  # 'rg -iF' works well
         fixed_string=True
     )
             
     if search_stdout:
         lines = search_stdout.strip().split('\n')
-        for line in lines[:20]: # Limit to 20 lines of context
+        for line in lines[:25]:  # Limit to 25 lines of context
             if not line.strip():
                 continue
             
@@ -190,21 +252,27 @@ def find_all_context(package_name: str, search_dir: str) -> List[Dict[str, Any]]
                 line_num = int(line_num_str)
                 content = content.strip()
                 
-                if len(content) > 300: # Truncate long lines
+                # Sanitize content before storing
+                content = sanitize_context_content(content)
+                
+                if len(content) > 300:  # Truncate long lines
                     content = content[:300] + "..."
                     
                 contexts.append({
-                    "file": os.path.relpath(file_path, search_dir), # Use relative path
+                    "file": os.path.relpath(file_path, search_dir),  # Use relative path
                     "line": line_num,
                     "content": content
                 })
             else:
                 # This handles the intermittent parsing warning
-                print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Could not parse search output line: {line[:70]}...")
+                if not line.startswith("grep:"):  # Ignore grep errors
+                    print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Could not parse search output line: {line[:70]}...")
     
     if not contexts:
         print(f"    [{Colors.BLUE}INFO{Colors.RESET}] No context found for '{package_name}'. Analyzing name only.")
         
+    # Filter for most relevant contexts
+    contexts = filter_relevant_context(contexts, package_name)
     return contexts
 
 def analyze_with_llm(package_name: str, package_type: str, home_org: str, context_list: List[Dict[str, Any]], max_retries: int = 3) -> Optional[Dict[str, Any]]:
@@ -234,7 +302,8 @@ def analyze_with_llm(package_name: str, package_type: str, home_org: str, contex
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_query}
         ],
-        "response_format": {"type": "json_object"}
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1  # Lower temperature for more consistent results
     }
 
     headers = {
@@ -244,7 +313,7 @@ def analyze_with_llm(package_name: str, package_type: str, home_org: str, contex
 
     for attempt in range(max_retries):
         try:
-            response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=60)
+            response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=90)
             if response.status_code == 200:
                 result = response.json()
                 json_text = result.get('choices', [{}])[0].get('message', {}).get('content', '{}')
@@ -253,7 +322,8 @@ def analyze_with_llm(package_name: str, package_type: str, home_org: str, contex
                 return analysis
             else:
                 print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] API request failed with status {response.status_code}: {response.text}")
-                if 400 <= response.status_code < 500: return None
+                if 400 <= response.status_code < 500: 
+                    return None
         except requests.RequestException as e:
             print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] API request exception: {e}")
         
@@ -297,7 +367,9 @@ def print_summary(report_path: str):
             for vuln in potential_vulns:
                 print(f"    {Colors.YELLOW}[VULN]{Colors.RESET} {Colors.BOLD}{vuln['package_name']}{Colors.RESET} ({vuln['package_type']})")
                 print(f"           {Colors.GREY}Justification: {vuln['justification']}{Colors.RESET}")
-                print(f"           {Colors.GREY}Highest Risk: {vuln['highest_risk_context']}{Colors.RESET}\n")
+                if vuln['highest_risk_context'] != 'N/A':
+                    print(f"           {Colors.GREY}Highest Risk: {vuln['highest_risk_context']}{Colors.RESET}")
+                print()
         else:
             print(f"  {Colors.GREEN}[INFO]{Colors.RESET} No potential vulnerabilities identified.")
         
@@ -313,7 +385,7 @@ def main(source_dir: str, target_org: str):
     Main function: find files, gather evidence, send to LLM, print summary.
     """
     global USE_RIPGREP
-    USE_RIPGREP = check_for_ripgrep() # Check for 'rg' at the start
+    USE_RIPGREP = check_for_ripgrep()  # Check for 'rg' at the start
 
     if not API_KEY:
         print(f"[{Colors.RED}ERROR{Colors.RESET}] 'OPENAI_API_KEY' environment variable not set. Aborting LLM analysis.", file=sys.stderr)
@@ -323,6 +395,10 @@ def main(source_dir: str, target_org: str):
     print(f"[{Colors.BLUE}INFO{Colors.RESET}] Using '{Colors.BOLD}{target_org}{Colors.RESET}' as the home organization name.")
     
     dep_dir = os.path.join(source_dir, "DEP")
+    if not os.path.isdir(dep_dir):
+        print(f"[{Colors.RED}ERROR{Colors.RESET}] Dependency directory not found: {dep_dir}", file=sys.stderr)
+        sys.exit(1)
+    
     results = []
     
     try:
@@ -341,22 +417,25 @@ def main(source_dir: str, target_org: str):
         file_path = os.path.join(dep_dir, filename)
         base_name = filename.replace(".potential", "")
         package_type = base_name.split('-')[-1] 
-        if not package_type: package_type = "unknown"
+        if not package_type: 
+            package_type = "unknown"
 
         print(f"[{Colors.BLUE}INFO{Colors.RESET}] Processing {package_type} packages from {filename}...")
         try:
-            # --- THIS IS THE FIX ---
-            with open(file_path, 'r') as f:
-                content = f.read()
-            
+            content = safe_file_read(file_path)
+            if content is None:
+                continue
+                
             package_names = [strip_ansi_codes(line.strip()) for line in content.splitlines() if line.strip()]
-            # --- END FIX ---
             
             if not package_names:
                 print(f"[{Colors.BLUE}INFO{Colors.RESET}] File {filename} is empty.")
                 continue
 
             for package_name in package_names:
+                if not validate_package_name(package_name):
+                    print(f"    [{Colors.YELLOW}WARN{Colors.RESET}] Skipping invalid package name: {package_name[:50]}...")
+                    continue
                 
                 # --- STEP 1: Gather Evidence ---
                 context_snippets = find_all_context(package_name, source_dir)
@@ -374,7 +453,7 @@ def main(source_dir: str, target_org: str):
                         "justification": "API call failed after retries.",
                         "highest_risk_context": "N/A"
                     })
-                time.sleep(1) # Rate limit
+                time.sleep(1)  # Rate limit
 
         except Exception as e:
             print(f"[{Colors.RED}ERROR{Colors.RESET}] Failed to read or process file {file_path}: {e}", file=sys.stderr)
@@ -410,6 +489,8 @@ if __name__ == "__main__":
         sys.exit(1)
         
     source_directory = sys.argv[1]
+    
+    # FIXED: Changed from .rstripc to .rstrip
     target_organization = os.path.basename(source_directory.rstrip(os.sep))
     
     if not os.path.isdir(source_directory):
@@ -417,4 +498,3 @@ if __name__ == "__main__":
         sys.exit(1)
 
     main(source_directory, target_organization)
-
