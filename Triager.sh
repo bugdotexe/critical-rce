@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Smart Dependency Confusion Triager v2.2
-# Fixed JSON escaping issues
+# Smart Dependency Confusion Triager v2.3
+# Fixed response parsing issues
 
 notice() { printf '\e[1;34m[INFO]\e[0m %s\n' "$*"; }
 warn()   { printf '\e[1;33m[WARN]\e[0m %s\n' "$*"; }
@@ -183,7 +183,7 @@ extract_deep_context() {
     rg --color=never -A2 -B2 "import.*$escaped_pkg\|require.*$escaped_pkg\|from.*$escaped_pkg" "$TARGET_DIR" 2>/dev/null | head -30 >> "$context_file" 2>/dev/null
 }
 
-# LLM analysis with proper JSON escaping
+# LLM analysis with better response handling
 analyze_with_gpt4o() {
     local package_name="$1"
     local package_type="$2"
@@ -276,13 +276,43 @@ Provide a thorough analysis based on the evidence found in the codebase context.
         return 1
     fi
     
+    # Extract content with better error handling
     local analysis
     analysis=$(echo "$response" | jq -r '.choices[0].message.content' 2>/dev/null)
+    
+    # Check if analysis is valid JSON
     if [ -n "$analysis" ] && [ "$analysis" != "null" ]; then
-        echo "$analysis" > "$output_file"
-        return 0
+        # Validate it's proper JSON
+        if echo "$analysis" | jq . >/dev/null 2>&1; then
+            echo "$analysis" > "$output_file"
+            return 0
+        else
+            # If not valid JSON, try to extract JSON from the response
+            local json_part
+            json_part=$(echo "$analysis" | grep -o '{.*}' | head -1)
+            if [ -n "$json_part" ] && echo "$json_part" | jq . >/dev/null 2>&1; then
+                echo "$json_part" > "$output_file"
+                return 0
+            else
+                # Fallback: create a basic JSON structure with the analysis
+                jq -n --arg pkg "$package_name" --arg type "$package_type" --arg analysis "$analysis" '{
+                    package_name: $pkg,
+                    package_type: $type,
+                    risk_level: "UNKNOWN",
+                    analysis: $analysis,
+                    error: "Response was not valid JSON"
+                }' > "$output_file"
+                return 0
+            fi
+        fi
     else
         err "Failed to extract analysis for $package_name"
+        # Save raw response for debugging
+        local debug_dir="$OUTPUT_DIR/debug_responses"
+        mkdir -p "$debug_dir"
+        local safe_name
+        safe_name=$(sanitize_filename "$package_name")
+        echo "$response" > "$debug_dir/${package_type}_${safe_name}_raw.json"
         return 1
     fi
 }
@@ -366,9 +396,9 @@ process_potential_packages() {
             # Check context file size - if too large, truncate
             local context_size
             context_size=$(wc -c < "$context_file" 2>/dev/null || echo 0)
-            if [ "$context_size" -gt 20000 ]; then
+            if [ "$context_size" -gt 15000 ]; then
                 warn "    Context file too large ($context_size bytes), truncating..."
-                head -c 15000 "$context_file" > "${context_file}.tmp" && mv "${context_file}.tmp" "$context_file"
+                head -c 12000 "$context_file" > "${context_file}.tmp" && mv "${context_file}.tmp" "$context_file"
                 echo "...[truncated]" >> "$context_file"
             fi
             
@@ -410,6 +440,7 @@ generate_intelligent_report() {
     local vulnerable_count=0
     local false_positive_count=0
     local uncertain_count=0
+    local error_count=0
     
     # Process all analysis files
     for analysis_file in "$analysis_dir"/*.json; do
@@ -428,20 +459,43 @@ generate_intelligent_report() {
         local analysis_content
         analysis_content=$(cat "$analysis_file")
         
-        # Try to parse the JSON analysis
-        local risk_level
-        risk_level=$(echo "$analysis_content" | jq -r '.risk_level // .assessment // .vulnerability // "unknown"' 2>/dev/null || echo "unknown")
-        
-        # Basic classification based on content analysis
-        if echo "$analysis_content" | grep -qi "\"risk_level\":\"CRITICAL\"\|\"risk_level\":\"HIGH\"\|vulnerable\|critical\|high.*risk\|dependency.*confusion"; then
-            vulnerable_count=$((vulnerable_count + 1))
-            echo "## 🔴 $package_name ($package_type)" >> "$report_file"
-        elif echo "$analysis_content" | grep -qi "\"risk_level\":\"LOW\"\|\"risk_level\":\"NONE\"\|false.*positive\|not.*vulnerable\|safe\|workspace\|local.*path\|git.*url\|private.*registry"; then
-            false_positive_count=$((false_positive_count + 1))
-            echo "## ✅ $package_name ($package_type)" >> "$report_file"
+        # Check if the file contains an error
+        if echo "$analysis_content" | grep -qi "\"error\""; then
+            error_count=$((error_count + 1))
+            echo "## ❌ $package_name ($package_type) - ANALYSIS ERROR" >> "$report_file"
         else
-            uncertain_count=$((uncertain_count + 1))
-            echo "## ⚠️  $package_name ($package_type)" >> "$report_file"
+            # Try to parse the JSON analysis
+            local risk_level
+            risk_level=$(echo "$analysis_content" | jq -r '.risk_level // .assessment // .vulnerability // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+            
+            # Classification based on risk level
+            case "$risk_level" in
+                "CRITICAL"|"HIGH")
+                    vulnerable_count=$((vulnerable_count + 1))
+                    echo "## 🔴 $package_name ($package_type) - $risk_level" >> "$report_file"
+                    ;;
+                "MEDIUM")
+                    uncertain_count=$((uncertain_count + 1))
+                    echo "## 🟡 $package_name ($package_type) - $risk_level" >> "$report_file"
+                    ;;
+                "LOW"|"NONE"|"FALSE_POSITIVE")
+                    false_positive_count=$((false_positive_count + 1))
+                    echo "## ✅ $package_name ($package_type) - $risk_level" >> "$report_file"
+                    ;;
+                *)
+                    # Fallback classification based on content
+                    if echo "$analysis_content" | grep -qi "vulnerable\|critical\|high.*risk\|dependency.*confusion"; then
+                        vulnerable_count=$((vulnerable_count + 1))
+                        echo "## 🔴 $package_name ($package_type)" >> "$report_file"
+                    elif echo "$analysis_content" | grep -qi "false.*positive\|not.*vulnerable\|safe\|workspace\|local.*path\|git.*url\|private.*registry"; then
+                        false_positive_count=$((false_positive_count + 1))
+                        echo "## ✅ $package_name ($package_type)" >> "$report_file"
+                    else
+                        uncertain_count=$((uncertain_count + 1))
+                        echo "## ⚠️  $package_name ($package_type)" >> "$report_file"
+                    fi
+                    ;;
+            esac
         fi
         
         echo '```json' >> "$report_file"
@@ -467,14 +521,18 @@ generate_intelligent_report() {
         false_positive_pct=$(echo "scale=1; $false_positive_count * 100 / $analyzed_count" | bc 2>/dev/null || echo "0")
         local uncertain_pct
         uncertain_pct=$(echo "scale=1; $uncertain_count * 100 / $analyzed_count" | bc 2>/dev/null || echo "0")
+        local error_pct
+        error_pct=$(echo "scale=1; $error_count * 100 / $analyzed_count" | bc 2>/dev/null || echo "0")
         
         echo "| 🔴 Potentially Vulnerable | $vulnerable_count | ${vulnerable_pct}% |" >> "$report_file"
         echo "| ✅ False Positives | $false_positive_count | ${false_positive_pct}% |" >> "$report_file"
         echo "| ⚠️  Uncertain/Manual Review | $uncertain_count | ${uncertain_pct}% |" >> "$report_file"
+        echo "| ❌ Analysis Errors | $error_count | ${error_pct}% |" >> "$report_file"
     else
         echo "| 🔴 Potentially Vulnerable | 0 | 0% |" >> "$report_file"
         echo "| ✅ False Positives | 0 | 0% |" >> "$report_file"
         echo "| ⚠️  Uncertain/Manual Review | 0 | 0% |" >> "$report_file"
+        echo "| ❌ Analysis Errors | 0 | 0% |" >> "$report_file"
     fi
     
     echo "| **Total Analyzed** | **$analyzed_count** | **100%** |" >> "$report_file"
@@ -488,6 +546,7 @@ generate_intelligent_report() {
     printf "🔴 Potentially Vulnerable: \e[1;31m%d\e[0m\n" "$vulnerable_count"
     printf "✅ False Positives: \e[1;32m%d\e[0m\n" "$false_positive_count" 
     printf "⚠️  Need Manual Review: \e[1;33m%d\e[0m\n" "$uncertain_count"
+    printf "❌ Analysis Errors: \e[1;35m%d\e[0m\n" "$error_count"
     printf "📊 Total Analyzed: \e[1;34m%d\e[0m\n" "$analyzed_count"
     echo
 }
