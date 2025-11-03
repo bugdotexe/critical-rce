@@ -59,7 +59,7 @@ fi
 # Environment Setup
 # ------------------------------
 TARGET=${ORG:-${USER:-$(basename "$FOLDER")}}
-OUTPUT="/tmp/${TARGET_NAME}"
+OUTPUT="/tmp/${TARGET}"
 mkdir -p "$OUTPUT"
 echo "$TARGET" | anew githubTargets.txt
 
@@ -69,7 +69,7 @@ echo "$TARGET" | anew githubTargets.txt
 cloneOrg() {
   notice "[-] Cloning GitHub Organization Repositories: $ORG"
   ghorg clone "$ORG" --fetch-all --quiet -p "$OUTPUT" -t "$GITHUB_TOKEN" \
-    --color enabled --skip-archived --skip-forks
+    --color enabled --skip-archived #--skip-forks
 }
 
 cloneUser() {
@@ -80,7 +80,6 @@ cloneUser() {
 
 useLocalFolder() {
   notice "[-] Using local folder as source: $FOLDER"
-  cp -r "$FOLDER" "$OUTPUT"
 }
 
 # ------------------------------
@@ -116,7 +115,7 @@ getDependencies() {
 
   notice "Fetching Ruby dependencies..."
   find "$OUTPUT" -name Gemfile | \
-    xargs -I {} awk '/^gem /{gsub(/["'\'']/, "", $2); print $2}' {} | sort -u | anew "$OUTPUT/DEP/ruby.deps"
+    xargs -I {} awk '{print}' {} | grep "^gem" | grep -v gemspec | sed "s/\"/\'/g" | awk -F "\'" '{print $2}' | awk NF | sort | uniq | anew "$OUTPUT/DEP/ruby.deps"
 }
 
 checkDependencies() {
@@ -168,8 +167,7 @@ main() {
     useLocalFolder
   fi
 
-  rm -f available-packages.txt
-  node main.js "$OUTPUT" $TARGET.available-packages.txt
+  node main.js "$OUTPUT" "$TARGET.available-packages.txt"
   #cp available-packages.txt $TARGET.available-packages.txt
 
   getDependencies
