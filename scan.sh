@@ -98,7 +98,7 @@ gem-name() {
 go-name() {
   local pkg=$1
   local code
-  code=$(curl $CURL_OPTS -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${pkg}/@v/list")
+  code=$(curl $CURL_OPTS -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${pkg}/@v/list")
   if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
 }
 
@@ -107,7 +107,7 @@ maven-name() {
   local group=$(echo "$pkg" | cut -d':' -f1 | tr '.' '/')
   local artifact=$(echo "$pkg" | cut -d':' -f2)
   local code
-  code=$(curl $CURL_OPTS -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/${group}/${artifact}/")
+  code=$(curl $CURL_OPTS -s -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/${group}/${artifact}/")
   if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
 }
 
@@ -123,7 +123,7 @@ docker-name() {
   fi
 
   local code
-  code=$(curl $CURL_OPTS -o /dev/null -w "%{http_code}" "$url")
+  code=$(curl $CURL_OPTS -s -o /dev/null -w "%{http_code}" "$url")
   if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
 }
 
