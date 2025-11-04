@@ -1,3 +1,5 @@
+#!/bin/bash
+
 notice() { printf '\e[1;34m[INFO]\e[0m %s\n' "$*"; }
 warn()   { printf '\e[1;33m[WARN]\e[0m %s\n' "$*"; }
 err()    { printf '\e[1;31m[ERROR]\e[0m %s\n' "$*"; }
@@ -105,7 +107,9 @@ go-name() {
 maven-name() {
   local pkg=$1
   local code
-  code=$(curl -Ls -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/$(echo "$pkg" | tr . /)/")
+  # Convert group:artifact to path
+  local path=$(echo "$pkg" | tr '.' '/')
+  code=$(curl -Ls -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/$path/")
   if [ "$code" -eq 404 ]; then
     printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"
   fi
@@ -114,6 +118,10 @@ maven-name() {
 docker-name() {
   local pkg=$1
   local code
+  # Skip if it contains template variables or doesn't look like a real image name
+  if [[ "$pkg" =~ \{\{.*\}\} ]] || [[ "$pkg" =~ \} ]] || [[ "$pkg" =~ ^[[:space:]]*$ ]] || [[ "$pkg" == *" "* ]]; then
+    return 0
+  fi
   code=$(curl -Ls -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/repositories/$pkg/")
   if [ "$code" -eq 404 ]; then
     printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"
@@ -163,8 +171,22 @@ getDependencies() {
     xargs -I {} awk -F'[<>]' '/<groupId>[^<]+<\/groupId>/ {gid=$3} /<artifactId>[^<]+<\/artifactId>/ {print gid":"$3}' {} | sort -u | anew "$OUTPUT/DEP/maven.deps"
 
   notice "Fetching Docker dependencies..."
-  find "$OUTPUT" -name "Dockerfile" -o -name "docker-compose.yml" -o -name "docker-compose.yaml" | \
-    xargs -I {} grep -h "image:" {} | awk '{print $2}' | cut -d: -f1 | grep -v "^$" | sort -u | anew "$OUTPUT/DEP/docker.deps"
+  # More precise Docker image extraction
+  find "$OUTPUT" -name "Dockerfile" -o -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "*.yaml" -o -name "*.yml" | \
+    xargs -I {} grep -h "image:" {} | \
+    awk '{print $2}' | \
+    # Remove quotes and template variables
+    sed 's/["'\'']//g' | \
+    # Filter out Helm template syntax and invalid names
+    grep -v "^{{" | \
+    grep -v "}}$" | \
+    grep -v "^\." | \
+    grep -v "/.*/" | \
+    # Basic validation - should look like docker image names
+    grep -E "^[a-zA-Z0-9][a-zA-Z0-9_.-]*([/][a-zA-Z0-9][a-zA-Z0-9_.-]*)?(:[a-zA-Z0-9][a-zA-Z0-9_.-]*)?$" | \
+    # Extract just the image name (before tag)
+    cut -d: -f1 | \
+    grep -v "^$" | sort -u | anew "$OUTPUT/DEP/docker.deps"
 
   notice "Fetching Rust dependencies..."
   find "$OUTPUT" -name "Cargo.toml" | \
@@ -194,7 +216,9 @@ checkDependencies() {
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/maven.potential"
 
   notice "Checking Docker images..."
-  cat "$OUTPUT/DEP/docker.deps" | xargs -I {} bash -c 'docker-name "$@"' _ {} | \
+  # Filter out empty lines and invalid names before processing
+  cat "$OUTPUT/DEP/docker.deps" | grep -v "^{{" | grep -v "^\." | grep -v "^[[:space:]]*$" | \
+    xargs -I {} bash -c 'docker-name "$@"' _ {} | \
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/docker.potential"
 
   notice "Checking Rust crates..."
@@ -222,6 +246,21 @@ secretFinding() {
 
 report() {
   warn "[+] Scan completed for $TARGET — results in $OUTPUT"
+  
+  # Show summary of potential findings
+  echo
+  notice "=== POTENTIAL FINDINGS SUMMARY ==="
+  for dep_file in "$OUTPUT/DEP"/*.potential; do
+    if [[ -f "$dep_file" ]]; then
+      count=$(wc -l < "$dep_file" 2>/dev/null || echo "0")
+      type=$(basename "$dep_file" .potential)
+      if [[ "$count" -gt 0 ]]; then
+        warn "$type: $count potential vulnerabilities"
+      else
+        notice "$type: $count potential vulnerabilities"
+      fi
+    fi
+  done
 }
 
 # ------------------------------
@@ -236,7 +275,7 @@ main() {
     useLocalFolder
   fi
 
-  node main.js "$OUTPUT" "$OUTPUT//extracted-npm.potential"
+  node main.js "$OUTPUT" "$OUTPUT/extracted-npm.potential"
 
   getDependencies
   checkDependencies
