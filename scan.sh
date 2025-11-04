@@ -98,34 +98,33 @@ gem-name() {
 go-name() {
   local pkg=$1
   local code
-  code=$(curl -Ls -o /dev/null -w "%{http_code}" "https://pkg.go.dev/$pkg")
-  if [ "$code" -eq 404 ]; then
-    printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"
-  fi
+  code=$(curl $CURL_OPTS -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${pkg}/@v/list")
+  if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
 }
 
 maven-name() {
   local pkg=$1
+  local group=$(echo "$pkg" | cut -d':' -f1 | tr '.' '/')
+  local artifact=$(echo "$pkg" | cut -d':' -f2)
   local code
-  # Convert group:artifact to path
-  local path=$(echo "$pkg" | tr '.' '/')
-  code=$(curl -Ls -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/$path/")
-  if [ "$code" -eq 404 ]; then
-    printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"
-  fi
+  code=$(curl $CURL_OPTS -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/${group}/${artifact}/")
+  if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
 }
 
 docker-name() {
   local pkg=$1
-  local code
-  # Skip if it contains template variables or doesn't look like a real image name
   if [[ "$pkg" =~ \{\{.*\}\} ]] || [[ "$pkg" =~ \} ]] || [[ "$pkg" =~ ^[[:space:]]*$ ]] || [[ "$pkg" == *" "* ]]; then
     return 0
   fi
-  code=$(curl -Ls -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/repositories/$pkg/")
-  if [ "$code" -eq 404 ]; then
-    printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"
+
+  local url="https://hub.docker.com/v2/repositories/$pkg/"
+  if [[ "$pkg" != */* ]]; then
+    url="https://hub.docker.com/v2/repositories/library/$pkg/"
   fi
+
+  local code
+  code=$(curl $CURL_OPTS -o /dev/null -w "%{http_code}" "$url")
+  if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
 }
 
 rust-name() {
