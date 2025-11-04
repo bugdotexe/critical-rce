@@ -159,33 +159,34 @@ getDependencies() {
     xargs -I {} awk '{print}' {} | grep "^gem" | grep -v gemspec | sed "s/\"/\'/g" | awk -F "\'" '{print $2}' | awk NF | sort | uniq | anew "$OUTPUT/DEP/ruby.deps"
 
   notice "Fetching Go dependencies..."
-  find "$OUTPUT" -name "go.mod" | \
-    xargs -I {} awk '/^require \(/,/^\)/ {if (!/^require \(/ && !/^\)/) print $1}' {} | sort -u | anew "$OUTPUT/DEP/go.deps"
-  
-  find "$OUTPUT" -name "go.mod" | \
-    xargs -I {} awk '/^require [^(]/ {print $2}' {} | sort -u | anew "$OUTPUT/DEP/go.deps"
+find "$OUTPUT" -name "go.mod" | while read -r file; do
+  awk '
+    /^require[[:space:]]+\(/ { in_block=1; next }
+    /^\)/ { in_block=0 }
+    in_block && /^[[:space:]]*[a-zA-Z0-9._\/-]+/ { print $1; next }
+    /^require[[:space:]]+[a-zA-Z0-9._\/-]+/ { print $2 }
+  ' "$file"
+done | sort -u | anew "$OUTPUT/DEP/go.deps"
 
-  notice "Fetching Maven dependencies..."
-  find "$OUTPUT" -name "pom.xml" | \
-    xargs -I {} awk -F'[<>]' '/<groupId>[^<]+<\/groupId>/ {gid=$3} /<artifactId>[^<]+<\/artifactId>/ {print gid":"$3}' {} | sort -u | anew "$OUTPUT/DEP/maven.deps"
+notice "Fetching Maven dependencies..."
+find "$OUTPUT" -name "pom.xml" | while read -r file; do
+  awk -F'[<>]' '
+    /<dependency>/ { in_dep=1; gid=""; aid="" }
+    /<\/dependency>/ {
+      if (in_dep && gid != "" && aid != "") print gid ":" aid;
+      in_dep=0
+    }
+    in_dep && /<groupId>/ { gid=$3 }
+    in_dep && /<artifactId>/ { aid=$3 }
+  ' "$file"
+done | sort -u | anew "$OUTPUT/DEP/maven.deps"
 
-  notice "Fetching Docker dependencies..."
-  # More precise Docker image extraction
-  find "$OUTPUT" -name "Dockerfile" -o -name "docker-compose.yml" -o -name "docker-compose.yaml" -o -name "*.yaml" -o -name "*.yml" | \
-    xargs -I {} grep -h "image:" {} | \
-    awk '{print $2}' | \
-    # Remove quotes and template variables
-    sed 's/["'\'']//g' | \
-    # Filter out Helm template syntax and invalid names
-    grep -v "^{{" | \
-    grep -v "}}$" | \
-    grep -v "^\." | \
-    grep -v "/.*/" | \
-    # Basic validation - should look like docker image names
-    grep -E "^[a-zA-Z0-9][a-zA-Z0-9_.-]*([/][a-zA-Z0-9][a-zA-Z0-9_.-]*)?(:[a-zA-Z0-9][a-zA-Z0-9_.-]*)?$" | \
-    # Extract just the image name (before tag)
-    cut -d: -f1 | \
-    grep -v "^$" | sort -u | anew "$OUTPUT/DEP/docker.deps"
+notice "Fetching Docker dependencies..."
+find "$OUTPUT" -type f \( -iname "Dockerfile" -o -iname "docker-compose*.yml" -o -iname "*.yaml" -o -iname "*.yml" \) | \
+  xargs -I {} grep -Eho "image:[[:space:]]*[\"']?([a-zA-Z0-9._\-/]+(:[a-zA-Z0-9._\-]+)?)" {} | \
+  sed -E 's/^image:[[:space:]]*[\"'\'']//; s/[\"'\'']$//' | \
+  cut -d: -f1 | grep -vE '^{{|^\.\.?/|^[[:space:]]*$' | sort -u | anew "$OUTPUT/DEP/docker.deps"
+
 
   notice "Fetching Rust dependencies..."
 find "$OUTPUT" -name "Cargo.toml" | while read -r file; do
