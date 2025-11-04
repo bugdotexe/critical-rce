@@ -189,9 +189,19 @@ getDependencies() {
     grep -v "^$" | sort -u | anew "$OUTPUT/DEP/docker.deps"
 
   notice "Fetching Rust dependencies..."
-  find "$OUTPUT" -name "Cargo.toml" | \
-    xargs -I {} awk -F '"' '/^[[:space:]]*name[[:space:]]*=[[:space:]]*"/ {print $2}' {} | sort -u | anew "$OUTPUT/DEP/rust.deps"
-}
+find "$OUTPUT" -name "Cargo.toml" | while read -r file; do
+  awk -F'=' '
+    /^\[dependencies\]/          { in_dep = 1; in_dev = 0; next }
+    /^\[dev-dependencies\]/      { in_dev = 1; in_dep = 0; next }
+    /^\[/                        { in_dep = 0; in_dev = 0 }  # other sections
+    (in_dep || in_dev) && /^[a-zA-Z0-9_-]+\s*=/ {
+      gsub(/[[:space:]]+/, "", $1)
+      print $1
+    }
+  ' "$file"
+done | sort -u | anew "$OUTPUT/DEP/rust.deps"
+
+  }
 
 checkDependencies() {
   export -f gem-name go-name maven-name docker-name rust-name
