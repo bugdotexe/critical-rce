@@ -99,7 +99,7 @@ go-name() {
   local pkg=$1
   local code
   code=$(curl $CURL_OPTS -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${pkg}/@v/list")
-  if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
+  if [ "$code" -eq 404 ]; then printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"; fi
 }
 
 maven-name() {
@@ -108,7 +108,7 @@ maven-name() {
   local artifact=$(echo "$pkg" | cut -d':' -f2)
   local code
   code=$(curl $CURL_OPTS -s -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/${group}/${artifact}/")
-  if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
+  if [ "$code" -eq 404 ]; then printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"; fi
 }
 
 docker-name() {
@@ -124,7 +124,7 @@ docker-name() {
 
   local code
   code=$(curl $CURL_OPTS -s -o /dev/null -w "%{http_code}" "$url")
-  if [ "$code" -eq 404 ]; then warn "$pkg is available"; fi
+  if [ "$code" -eq 404 ]; then printf '\e[1;33m[WARN]\e[0m %s\n' "$pkg is available"; fi
 }
 
 rust-name() {
