@@ -19,12 +19,14 @@ echo -e " █████                             █████           
                       ░░░░░░                                                             "
 echo -e "[WARN] Make \e[31mCritical\e[0m great again"
 
+
 # ------------------------------
 # Parse arguments
 # ------------------------------
 USER=""
 ORG=""
 FOLDER=""
+GITLAB=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -40,7 +42,11 @@ while [[ "$#" -gt 0 ]]; do
       FOLDER=$2
       shift 2
       ;;
-    *)
+    -g|--gitlab)
+      GITLAB=$2
+      shift 2
+      ;;
+     *)
       warn "Usage: bash scan.sh -u <USER> | -o <ORG> | -f <FOLDER>"
       exit 1
       ;;
@@ -50,15 +56,15 @@ done
 # ------------------------------
 # Validation
 # ------------------------------
-if [[ -z "$USER" && -z "$ORG" && -z "$FOLDER" ]]; then
-  err "[-] You must specify a target with -u, -o, or -f"
+if [[ -z "$USER" && -z "$ORG" && -z "$FOLDER" && -z "$GITLAB" ]]; then
+  err "[-] You must specify a target with -u, -o, -g, or -f"
   exit 1
 fi
 
 # ------------------------------
 # Environment Setup
 # ------------------------------
-TARGET=${ORG:-${USER:-$(basename "$FOLDER")}}
+TARGET=${ORG:-${USER:-${GITLAB:-$(basename "$FOLDER")}}}
 OUTPUT="/tmp/${TARGET}"
 mkdir -p "$OUTPUT"
 echo "$TARGET" | anew githubTargets.txt
@@ -69,7 +75,7 @@ echo "$TARGET" | anew githubTargets.txt
 cloneOrg() {
   notice "[-] Cloning GitHub Organization Repositories: $ORG"
   ghorg clone "$ORG" --fetch-all --quiet -p "$OUTPUT" -t "$GITHUB_TOKEN" \
-    --color enabled --skip-archived #--skip-forks
+    --color enabled --skip-forks --skip-archived
 }
 
 cloneUser() {
@@ -80,6 +86,11 @@ cloneUser() {
 
 useLocalFolder() {
   notice "[-] Using local folder as source: $FOLDER"
+}
+
+cloneGitlabGroup() {
+  notice "[-] Cloning Gitlab Group Repositories: $GITLAB"
+  ghorg clone $GITLAB --scm=gitlab --path=$OUTPUT
 }
 
 # ------------------------------
@@ -136,6 +147,15 @@ rust-name() {
   fi
 }
 
+github-takeover() {
+  local url=$1
+  local code
+  code=$(curl -Ls -o /dev/null -w "%{http_code}" "$url")
+  if [ "$code" -eq 302 ]; then
+    printf '\e[1;33m[WARN]\e[0m %s\n' "|-Potential Takeover-| $url => $code"
+  fi
+}
+
 broken-github() {
   local url=$1
   local code
@@ -157,6 +177,16 @@ getDependencies() {
   notice "Fetching Ruby dependencies..."
   find "$OUTPUT" -name Gemfile | \
     xargs -I {} awk '{print}' {} | grep "^gem" | grep -v gemspec | sed "s/\"/\'/g" | awk -F "\'" '{print $2}' | awk NF | sort | uniq | anew "$OUTPUT/DEP/ruby.deps"
+
+  notice "[-] Fetching broken GitHub references: Github Url"
+ GH_URL_REGEX='https?://github\.com/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?'
+  grep -roh '(http.)?://(raw.githubusercontent.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
+  grep -roh '(http.)?://(raw.github.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
+  grep -rhoE "$GH_URL_REGEX" "$OUTPUT" 2>/dev/null | sort -u | anew "$OUTPUT/DEP/github.account"
+  grep -roh '(http.)?://(media.githubusercontent.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
+ notice "[-] Fetching broken GitHub references: Github Action"
+  grep -roh -E "uses: [-a-zA-Z0-9\.]+/[-a-zA-Z0-9.]+\@[-a-zA-Z0-9\.]+" $OUTPUT | awk -F ": " '{print $2}' | awk -F "/" '{print "https://github.com/"$1}' | sort | uniq | grep -v "github.com/actions$" | anew "$OUTPUT/DEP/github.action"
+
 
   notice "Fetching Go dependencies..."
 find "$OUTPUT" -name "go.mod" | while read -r file; do
@@ -182,21 +212,37 @@ find "$OUTPUT" -name "pom.xml" | while read -r file; do
 done | sort -u | anew "$OUTPUT/DEP/maven.deps"
 
 notice "Fetching Docker dependencies..."
+
 find "$OUTPUT" -type f \( -iname "Dockerfile" -o -iname "docker-compose*.yml" -o -iname "*.yaml" -o -iname "*.yml" \) | \
-  xargs -I {} grep -Eho "image:[[:space:]]*[\"']?([a-zA-Z0-9._\-/]+(:[a-zA-Z0-9._\-]+)?)" {} | \
-  sed -E 's/^image:[[:space:]]*[\"'\'']//; s/[\"'\'']$//' | \
-  cut -d: -f1 | grep -vE '^{{|^\.\.?/|^[[:space:]]*$' | sort -u | anew "$OUTPUT/DEP/docker.deps"
+xargs -I {} grep -Eho "image:[[:space:]]*[\"']?([a-zA-Z0-9._/:-]+)" {} | \
+sed -E 's/^image:[[:space:]]*[\"'\'']//; s/[\"'\'']$//' | \
+cut -d: -f1 | grep -vE '^{{|^\.\.?/|^[[:space:]]*$' | sort -u | anew "$OUTPUT/DEP/docker.deps"
 
 
   notice "Fetching Rust dependencies..."
 find "$OUTPUT" -name "Cargo.toml" | while read -r file; do
-  awk -F'=' '
-    /^\[dependencies\]/          { in_dep = 1; in_dev = 0; next }
-    /^\[dev-dependencies\]/      { in_dev = 1; in_dep = 0; next }
-    /^\[/                        { in_dep = 0; in_dev = 0 }  # other sections
-    (in_dep || in_dev) && /^[a-zA-Z0-9_-]+\s*=/ {
-      gsub(/[[:space:]]+/, "", $1)
-      print $1
+  awk '
+    # Trim leading/trailing whitespace from the line
+    { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0) }
+    
+    # Skip empty lines or comments
+    /^(#|$)/ { next }
+
+    # Handle dependency sections, including target-specific ones
+    /^\[(dev-|build-)?dependencies\]/ { in_dep = 1; next }
+    /^\[target\..*\.(dev-|build-)?dependencies\]/ { in_dep = 1; next }
+
+    # If we see a new section header, we are no longer in a dependency section
+    /^\[/ { in_dep = 0 }
+
+    # If we are in a dependency section, parse the line
+    (in_dep == 1) {
+      # Match the package name (key) at the start of the line
+      # A key is alphanumeric + hyphen/underscore/dot
+      if (match($0, /^[a-zA-Z0-9._-]+/)) {
+        pkg = substr($0, RSTART, RLENGTH)
+        print pkg
+      }
     }
   ' "$file"
 done | sort -u | anew "$OUTPUT/DEP/rust.deps"
@@ -218,8 +264,11 @@ checkDependencies() {
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/gem.potential"
 
   notice "Checking Go modules..."
+  export -f github-takeover
   cat "$OUTPUT/DEP/go.deps" | xargs -I {} bash -c 'go-name "$@"' _ {} | \
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/go.potential"
+  warn "Checking Go modules: Available..."
+   cat "$OUTPUT/DEP/go.potential" | grep "github.com" | sort -u | xargs -I {} bash -c 'github-takeover "$@"' _ {} | anew "$OUTPUT/DEP/go.takeover"
 
   notice "Checking Maven artifacts..."
   cat "$OUTPUT/DEP/maven.deps" | xargs -I {} bash -c 'maven-name "$@"' _ {} | \
@@ -238,10 +287,10 @@ checkDependencies() {
 
 brokenSupplychain() {
   export -f broken-github
-  notice "[-] Finding broken GitHub references..."
-  grep -roh -E "uses: [-a-zA-Z0-9\.]+/[-a-zA-Z0-9.]+@" "$OUTPUT" | \
-    awk -F "/" '{print "https://github.com/"$1}' | sort -u | \
-    xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
+  notice "[-] Checking broken GitHub references: Github Url"
+ cat "$OUTPUT/DEP/github.account" | sort -u | xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
+ notice "[-] Checking broken GitHub references: Github Action"
+ cat "$OUTPUT/DEP/github.action" | sort -u | xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
 }
 
 secretFinding() {
@@ -255,7 +304,7 @@ secretFinding() {
 }
 
 report() {
-  warn "[+] Scan completed for $TARGET — results in $OUTPUT"
+  warn "[+] Scan completed for $TARGET â€” results in $OUTPUT"
   
   # Show summary of potential findings
   echo
@@ -275,7 +324,8 @@ report() {
 
 # ------------------------------
 # Main Execution
-# ------------------------------
+# ---------------------------
+
 main() {
   if [[ -n "$ORG" ]]; then
     cloneOrg
@@ -283,10 +333,11 @@ main() {
     cloneUser
   elif [[ -n "$FOLDER" ]]; then
     useLocalFolder
+  elif [[ -n "$GITLAB" ]]; then
+    cloneGitlabGroup
   fi
 
   node main.js "$OUTPUT" "$OUTPUT/extracted-npm.potential"
-
   getDependencies
   checkDependencies
   brokenSupplychain
