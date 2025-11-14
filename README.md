@@ -14,7 +14,7 @@
                       ░░░░░░                                                             
 ```
 
-# Repo Security Scanner
+# Depende Audit
 
 This script is a comprehensive security auditing tool designed to scan GitHub organizations, user repositories, GitLab groups, or local codebases. It automates repository cloning, dependency extraction, and vulnerability checking, with a strong focus on **supply chain security** and **secret detection**.
 
