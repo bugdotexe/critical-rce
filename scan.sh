@@ -19,7 +19,6 @@ echo -e " █████                             █████           
                       ░░░░░░                                                             "
 echo -e "[WARN] Make \e[31mCritical\e[0m great again"
 
-
 # ------------------------------
 # Parse arguments
 # ------------------------------
@@ -178,16 +177,6 @@ getDependencies() {
   find "$OUTPUT" -name Gemfile | \
     xargs -I {} awk '{print}' {} | grep "^gem" | grep -v gemspec | sed "s/\"/\'/g" | awk -F "\'" '{print $2}' | awk NF | sort | uniq | anew "$OUTPUT/DEP/ruby.deps"
 
-  notice "[-] Fetching broken GitHub references: Github Url"
- GH_URL_REGEX='https?://github\.com/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?'
-  grep -roh '(http.)?://(raw.githubusercontent.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
-  grep -roh '(http.)?://(raw.github.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
-  grep -rhoE "$GH_URL_REGEX" "$OUTPUT" 2>/dev/null | sort -u | anew "$OUTPUT/DEP/github.account"
-  grep -roh '(http.)?://(media.githubusercontent.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
- notice "[-] Fetching broken GitHub references: Github Action"
-  grep -roh -E "uses: [-a-zA-Z0-9\.]+/[-a-zA-Z0-9.]+\@[-a-zA-Z0-9\.]+" $OUTPUT | awk -F ": " '{print $2}' | awk -F "/" '{print "https://github.com/"$1}' | sort | uniq | grep -v "github.com/actions$" | anew "$OUTPUT/DEP/github.action"
-
-
   notice "Fetching Go dependencies..."
 find "$OUTPUT" -name "go.mod" | while read -r file; do
   awk '
@@ -222,23 +211,12 @@ cut -d: -f1 | grep -vE '^{{|^\.\.?/|^[[:space:]]*$' | sort -u | anew "$OUTPUT/DE
   notice "Fetching Rust dependencies..."
 find "$OUTPUT" -name "Cargo.toml" | while read -r file; do
   awk '
-    # Trim leading/trailing whitespace from the line
     { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0) }
-    
-    # Skip empty lines or comments
     /^(#|$)/ { next }
-
-    # Handle dependency sections, including target-specific ones
     /^\[(dev-|build-)?dependencies\]/ { in_dep = 1; next }
     /^\[target\..*\.(dev-|build-)?dependencies\]/ { in_dep = 1; next }
-
-    # If we see a new section header, we are no longer in a dependency section
     /^\[/ { in_dep = 0 }
-
-    # If we are in a dependency section, parse the line
     (in_dep == 1) {
-      # Match the package name (key) at the start of the line
-      # A key is alphanumeric + hyphen/underscore/dot
       if (match($0, /^[a-zA-Z0-9._-]+/)) {
         pkg = substr($0, RSTART, RLENGTH)
         print pkg
@@ -248,6 +226,23 @@ find "$OUTPUT" -name "Cargo.toml" | while read -r file; do
 done | sort -u | anew "$OUTPUT/DEP/rust.deps"
 
   }
+  
+brokenSupplychain() {
+  export -f broken-github
+ notice "[-] Finding broken GitHub references: Github Url"
+ GH_URL_REGEX='https?://github\.com/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?'
+  grep -roh '(http.)?://(raw.githubusercontent.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
+  grep -roh '(http.)?://(raw.github.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
+  grep -rhoE "$GH_URL_REGEX" "$OUTPUT" 2>/dev/null | sort -u | anew "$OUTPUT/DEP/github.account"
+  grep -roh '(http.)?://(media.githubusercontent.com)\b([-a-zA-Z0-9@:%_\+.~#?&\/=]*)' $OUTPUT | sort | uniq | anew "$OUTPUT/DEP/github.account"
+ notice "[-] Finding broken GitHub references: Github Action"
+  grep -roh -E "uses: [-a-zA-Z0-9\.]+/[-a-zA-Z0-9.]+\@[-a-zA-Z0-9\.]+" $OUTPUT | awk -F ": " '{print $2}' | awk -F "/" '{print "https://github.com/"$1}' | sort | uniq | grep -v "github.com/actions$" | anew "$OUTPUT/DEP/github.action"
+
+ notice "[-] Checking broken GitHub references: Github Url"
+ cat "$OUTPUT/DEP/github.account" | sort -u | xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
+ notice "[-] Checking broken GitHub references: Github Action"
+ cat "$OUTPUT/DEP/github.action" | sort -u | xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
+}
 
 checkDependencies() {
   export -f gem-name go-name maven-name docker-name rust-name
@@ -275,7 +270,6 @@ checkDependencies() {
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/maven.potential"
 
   notice "Checking Docker images..."
-  # Filter out empty lines and invalid names before processing
   cat "$OUTPUT/DEP/docker.deps" | grep -v "^{{" | grep -v "^\." | grep -v "^[[:space:]]*$" | \
     xargs -I {} bash -c 'docker-name "$@"' _ {} | \
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/docker.potential"
@@ -285,14 +279,6 @@ checkDependencies() {
     grep "is available" | cut -d ' ' -f2 | anew "$OUTPUT/DEP/rust.potential"
 }
 
-brokenSupplychain() {
-  export -f broken-github
-  notice "[-] Checking broken GitHub references: Github Url"
- cat "$OUTPUT/DEP/github.account" | sort -u | xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
- notice "[-] Checking broken GitHub references: Github Action"
- cat "$OUTPUT/DEP/github.action" | sort -u | xargs -I {} bash -c 'broken-github "$@"' _ {} | anew "$OUTPUT/DEP/github.potential"
-}
-
 secretFinding() {
   if [[ -n "$ORG" ]]; then
     trufflehog github --only-verified --token="$GITHUB_TOKEN" \
@@ -300,13 +286,15 @@ secretFinding() {
       --archive-max-depth=50 --org="$ORG"
   elif [[ -n "$USER" ]]; then
     trufflehog filesystem --only-verified $OUTPUT
+  elif [[ -n "$FOLDER" ]]; then
+    trufflehog filesystem --only-verified $OUTPUT
+  elif [[ -n "$GITLAB" ]]; then
+    trufflehog filesystem --only-verified $OUTPUT
   fi
 }
 
 report() {
-  warn "[+] Scan completed for $TARGET â€” results in $OUTPUT"
-  
-  # Show summary of potential findings
+  warn "[+] Scan completed for $TARGET — results in $OUTPUT"
   echo
   notice "=== POTENTIAL FINDINGS SUMMARY ==="
   for dep_file in "$OUTPUT/DEP"/*.potential; do
