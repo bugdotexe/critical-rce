@@ -46,8 +46,9 @@ This script relies on several external tools. Please ensure they are installed a
   * **[ghorg](https://github.com/gabrie30/ghorg)**: Used to clone repositories from GitHub and GitLab.
   * **[trufflehog](https://github.com/trufflesecurity/trufflehog)**: Used for secret scanning.
   * **[anew](https://github.com/tomnomnom/anew)**: Used for appending unique lines to output files.
-  * **[get-dependencies](https://www.npmjs.com/package/get-dependencies)**: (Assumed) An NPM package to parse `package.json` files. Install via `npm i -g get-dependencies`.
-
+  * **[get-dependencies](https://www.npmjs.com/package/get-dependencies)**: An NPM package to parse `package.json` files. Install via `$ npm i -g get-dependencies`.
+  * **[pip-name](https://github.com/danishprakash/pip-name)**: Use to chech pypi package name availability.Install via `$ pip install pip-name`
+    
 ## ⚙️ Configuration
 
 You must export a **GitHub Token** with sufficient permissions (`repo`, `read:org`) for `ghorg` and `trufflehog` to function correctly.
