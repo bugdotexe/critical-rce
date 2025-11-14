@@ -47,8 +47,6 @@ This script relies on several external tools. Please ensure they are installed a
   * **[trufflehog](https://github.com/trufflesecurity/trufflehog)**: Used for secret scanning.
   * **[anew](https://github.com/tomnomnom/anew)**: Used for appending unique lines to output files.
   * **[get-dependencies](https://www.npmjs.com/package/get-dependencies)**: (Assumed) An NPM package to parse `package.json` files. Install via `npm i -g get-dependencies`.
-  * **`main.js`**: This script assumes a local `main.js` file is present for Node.js-based extraction.
-  * **`npm-name` & `pip-name`**: This script calls `npm-name` and `pip-name` as external commands. You must have your own scripts or tools with these names that can check the availability of a package on their respective registries.
 
 ## ⚙️ Configuration
 
@@ -113,8 +111,4 @@ A final summary is printed to the console, highlighting the number of potential 
 [INFO] pip: 0 potential vulnerabilities
 [INFO] rust: 0 potential vulnerabilities
 ```
-
-## ⚖️ License
-
-This project is licensed under the [MIT License](https://www.google.com/search?q=LICENSE) (or your preferred license).
 
